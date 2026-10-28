@@ -24,6 +24,9 @@ TARGET = rtconfig.OUTPUT_DIR + rtconfig.TARGET_NAME + '.' + rtconfig.TARGET_EXT
 objs = PrepareBuilding(None,buildlib=rtconfig.libname)
 env = GetCurrentEnv()
 
+env['INSTALL_PATH'] = '../lib'
+env['LIBNAME'] = 'sdk'
+
 # Build application.
 DoBuilding(TARGET, objs)
 

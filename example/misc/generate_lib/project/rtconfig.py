@@ -1,1 +1,1 @@
-libname="lib"
+libname="*"

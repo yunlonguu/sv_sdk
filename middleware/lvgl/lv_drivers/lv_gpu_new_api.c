@@ -1,0 +1,3131 @@
+/*
+ * SPDX-FileCopyrightText: 2019-2022 SiFli Technologies(Nanjing) Co., Ltd
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include "rtconfig.h"
+#include "littlevgl2rtt.h"
+#include "lvgl.h"
+#include "board.h"
+//#include "EventRecorder.h"
+#include "drv_io.h"
+#include "drv_flash.h"
+#include "log.h"
+#include "bf0_pm.h"
+#include "section.h"
+#include "cpu_usage_profiler.h"
+#include "lv_draw_sw.h"
+#include "src/misc/lv_gc.h"
+#include "lvsf_perf.h"
+#include "lv_gpu_sifli_epic.h"
+
+
+
+
+#if LV_USE_GPU
+#include "drv_epic.h"
+#include "app_mem.h"
+
+
+#define GPU_BLEND_EXP_MS     500
+#define FOV                  40
+
+/*Add line drawing and merging operations*/
+#define LINE_POINTS_CNT_MAX 48                  //Merged Points Count
+static drv_epic_operation *p_line_op = NULL;    //Save the last struct pointer
+
+#ifdef RT_USING_PM
+    #define GPU_DEVICE_START()   rt_pm_hw_device_start()
+    #define GPU_DEVICE_STOP()     rt_pm_hw_device_stop()
+#else
+    #define GPU_DEVICE_START()
+    #define GPU_DEVICE_STOP()
+#endif  /* RT_USING_PM */
+#define LV_AREA_TO_EPIC_AREA(p_epic_area, p_lv_area) \
+        (p_epic_area)->x0 = (p_lv_area)->x1; \
+        (p_epic_area)->y0 = (p_lv_area)->y1; \
+        (p_epic_area)->x1 = (p_lv_area)->x2; \
+        (p_epic_area)->y1 = (p_lv_area)->y2;
+
+#define LV_AREA_INSERT_EPIC_AREA(p_epic_area, p_lv_area) \
+    (p_epic_area)->x0 = LV_MIN((p_epic_area)->x0, (p_lv_area)->x1); \
+    (p_epic_area)->y0 = LV_MIN((p_epic_area)->y0, (p_lv_area)->y1); \
+    (p_epic_area)->x1 = LV_MAX((p_epic_area)->x1, (p_lv_area)->x2); \
+    (p_epic_area)->y1 = LV_MAX((p_epic_area)->y1, (p_lv_area)->y2);
+
+#define REDER_MEM_LOCK      (1)
+#define REDER_MEM_UNLOCK    (-1)
+
+/* Shared cache for A8 parent-mask snapshots.
+ *
+ * Every EPIC operation that renders under a LVGL parent mask used to build
+ * its own per-operation coverage snapshot. Operations that share the same
+ * parent mask within one frame now reuse a single coverage buffer through a
+ * hash-bucketed, reference-counted cache: the first operation generates the
+ * coverage, later operations with an equal key only bump the ref count.
+ *
+ * The key is geometric (buffer area + each inner radius mask's rect/radius)
+ * rather than the LVGL mask parameter addresses, because LVGL reuses the
+ * same parameter structs across objects. Only stacks made purely of inner
+ * (hole-punch) radius masks are cached; outer radius, non-radius and empty
+ * stacks fall back to the per-operation snapshot path. */
+typedef struct parent_mask_cache parent_mask_cache_t;
+
+#if LV_DRAW_COMPLEX
+#define PARENT_MASK_CACHE_BUCKET_COUNT 32 /* Cache hash-table bucket count */
+
+typedef struct
+{
+    lv_area_t rect;     /* Bounding rect of one radius mask (cfg.rect) */
+    lv_coord_t radius;  /* Corner radius of that mask (cfg.radius) */
+} parent_mask_key_item_t;
+
+typedef struct
+{
+    lv_area_t area;                                  /* Snapshot area: buf_area trimmed by each inner mask rect */
+    uint32_t hash;                                   /* FNV-1a hash; selects the bucket only, equality is field-by-field */
+    uint8_t mask_count;                              /* Number of active inner radius masks captured */
+    parent_mask_key_item_t masks[_LV_MASK_MAX_NUM];  /* Per-mask geometry, first mask_count entries are valid */
+} parent_mask_key_t;
+
+struct parent_mask_cache
+{
+    struct parent_mask_cache *next; /* Next entry in the hash bucket chain */
+    parent_mask_key_t key;          /* The cache key this entry was built for */
+    uint32_t ref_count;             /* Number of operations currently referencing this coverage */
+    uint8_t *coverage;              /* Shared A8 coverage (1 byte per pixel, 255 = fully kept) */
+};
+
+static parent_mask_cache_t *parent_mask_cache_buckets[PARENT_MASK_CACHE_BUCKET_COUNT];
+static void parent_mask_cache_release(parent_mask_cache_t *cache);
+#endif
+
+void my_gpu_wait(lv_draw_ctx_t *draw_ctx);
+static void snapshot_parent_mask(drv_epic_operation *op);
+
+typedef struct
+{
+    lv_draw_layer_ctx_t base;
+    lv_draw_layer_ctx_t *parent;
+    drv_epic_render_list_t list;
+    lv_img_cf_t cf;
+    uint32_t buf_size;
+} epic_layer_ctx_t;
+
+#ifdef LV_USING_FREETYPE_ENGINE
+    lv_font_t *lvsf_get_glyph_by_lib(const lv_font_t *font, uint32_t u_letter, lv_font_glyph_dsc_t *g);
+#endif
+
+static void lv_gpu_render_trav_cb(drv_epic_operation *op, void *usr_data)
+{
+    if (!op || !usr_data)
+    {
+        LOG_E("%s: parameter[op] %p [usr_data] %p is null.", __func__, op, usr_data);
+        return;
+    }
+
+    int ref_count = (int)usr_data;
+
+    /* Release the parent mask this operation referenced. A cache-backed mask
+     * only drops the shared entry's ref count; an independently snapshot mask
+     * is freed directly. The shared coverage must outlive every operation
+     * that still references it, so it is never freed here while refs remain. */
+    if (REDER_MEM_UNLOCK == ref_count && op->parent_mask_owned)
+    {
+        if (op->parent_mask_ref)
+        {
+#if LV_DRAW_COMPLEX
+            /* Shared cache entry: decrement ref count, freed on last release. */
+            parent_mask_cache_release((parent_mask_cache_t *)op->parent_mask_ref);
+#endif
+            op->parent_mask_ref = NULL;
+        }
+        else
+        {
+            /* Independently allocated snapshot: owned solely by this op. */
+            app_cache_free(op->mask.data);
+        }
+        op->mask.data = NULL;
+        op->parent_mask_owned = 0;
+    }
+
+    if (op->mask.data && !op->parent_mask_owned && !(op->op == DRV_EPIC_DRAW_IMAGE && op->desc.blend.layer_owned) &&
+            !(op->op == DRV_EPIC_DRAW_ARC && op->desc.arc.image) &&
+            !(op->op == DRV_EPIC_DRAW_RECT && op->desc.rectangle.bg_image) &&
+            !(op->op == DRV_EPIC_DRAW_BORDER && op->desc.border.mask_owned) &&
+            !(op->op == DRV_EPIC_DRAW_SHADOW && op->desc.shadow.mask_owned))
+        app_mem_set_ref_count((void *)op->mask.data, ref_count, MEM_ASYN_IMG);
+
+    switch (op->op)
+    {
+    case DRV_EPIC_DRAW_BORDER:
+    case DRV_EPIC_DRAW_SHADOW:
+        if (REDER_MEM_UNLOCK == ref_count &&
+                ((op->op == DRV_EPIC_DRAW_BORDER && op->desc.border.mask_owned) ||
+                 (op->op == DRV_EPIC_DRAW_SHADOW && op->desc.shadow.mask_owned)))
+        {
+            app_cache_free(op->mask.data);
+            op->mask.data = NULL;
+            if (op->op == DRV_EPIC_DRAW_BORDER) op->desc.border.mask_owned = 0;
+            else op->desc.shadow.mask_owned = 0;
+        }
+        break;
+    case DRV_EPIC_DRAW_RECT:
+        if (op->desc.rectangle.bg_image && op->desc.rectangle.bg_image->layer.data)
+            app_mem_set_ref_count((void *)op->desc.rectangle.bg_image->layer.data, ref_count, MEM_ASYN_IMG);
+        if (op->desc.rectangle.bg_image && REDER_MEM_UNLOCK == ref_count)
+        {
+            app_cache_free(op->desc.rectangle.bg_image);
+            op->desc.rectangle.bg_image = NULL;
+            op->mask.data = NULL;
+        }
+        break;
+    case DRV_EPIC_DRAW_IMAGE:
+        if (op->desc.blend.layer_owned)
+        {
+            if (REDER_MEM_UNLOCK == ref_count)
+            {
+                uint8_t *data = op->desc.blend.layer.data;
+                /* Owned L8 snapshots include the palette header before the pixels. */
+                if (data && op->desc.blend.layer.color_mode == EPIC_INPUT_L8)
+                    data = op->desc.blend.layer.lookup_table - sizeof(uint32_t);
+                app_cache_free(data);
+                op->desc.blend.layer.data = NULL;
+                op->desc.blend.layer.lookup_table = NULL;
+                if (op->mask.data) app_cache_free(op->mask.data);
+                op->mask.data = NULL;
+                op->desc.blend.layer_owned = 0;
+            }
+        }
+        else if (op->desc.blend.layer.data)
+            app_mem_set_ref_count((void *)op->desc.blend.layer.data, ref_count, MEM_ASYN_IMG);
+        if ((REDER_MEM_UNLOCK == ref_count) && op->desc.blend.layer.transform_cfg.trans_matrix)
+        {
+            app_free(op->desc.blend.layer.transform_cfg.trans_matrix);
+            op->desc.blend.layer.transform_cfg.trans_matrix = NULL;
+        }
+        break;
+    case DRV_EPIC_DRAW_LETTERS:
+        if (op->desc.label.p_letters)
+        {
+            for (uint32_t i = 0; i < op->desc.label.letter_num; i++)
+            {
+                drv_epic_letter_type_t *p_letter = op->desc.label.p_letters + i;
+                if (!p_letter->data) continue;
+                app_mem_set_ref_count((uint8_t *)p_letter->data, ref_count, MEM_ASYN_FONT);
+            }
+        }
+        break;
+    case DRV_EPIC_DRAW_LINE:
+        if (op->desc.line.p_points && REDER_MEM_UNLOCK == ref_count)
+        {
+            app_free(op->desc.line.p_points);
+            op->desc.line.p_points = NULL;
+            op->desc.line.point_cnt = 0;
+        }
+
+        break;
+    case DRV_EPIC_DRAW_ARC:
+        if (op->desc.arc.image && REDER_MEM_UNLOCK == ref_count)
+        {
+            app_free(op->desc.arc.image);
+            op->desc.arc.image = NULL;
+        }
+
+        break;
+    default:
+        break;
+    }
+}
+
+static rt_err_t lv_gpu_render_mem_lock(void *ptr, int type)
+{
+    app_mem_set_ref_count(ptr, REDER_MEM_LOCK, type);
+    return RT_EOK;
+}
+
+rt_err_t lv_gpu_render_mem_unlock(drv_epic_render_list_t list)
+{
+    rt_err_t ret;
+
+    if (!list) return RT_EOK;
+
+    ret = drv_epic_render_trav(list, lv_gpu_render_trav_cb, (void *)REDER_MEM_UNLOCK);
+    app_mem_free_asyn_node();
+    return ret;
+}
+
+static rt_err_t lv_gpu_render_commit_op(drv_epic_operation *op)
+{
+    snapshot_parent_mask(op);
+    lv_gpu_render_trav_cb(op, (void *)REDER_MEM_LOCK);
+    return drv_epic_commit_op(op);
+}
+
+bool EPIC_SUPPORTED_CF(lv_img_cf_t cf)
+{
+    bool ret;
+
+    switch (cf)
+    {
+#ifdef HAL_EZIP_MODULE_ENABLED
+    case LV_IMG_CF_RAW:
+    case LV_IMG_CF_RAW_ALPHA:
+#endif /* HAL_EZIP_MODULE_ENABLED */
+    case LV_IMG_CF_TRUE_COLOR:
+    case LV_IMG_CF_TRUE_COLOR_ALPHA:
+    case LV_IMG_CF_TRUE_COLOR_CHROMA_KEYED:
+    case LV_IMG_CF_RGB565:
+    case LV_IMG_CF_RGB888:
+    case LV_IMG_CF_RGBA5658:
+    case LV_IMG_CF_RGBA8888:
+#ifdef EPIC_SUPPORT_A2
+    case LV_IMG_CF_ALPHA_2BIT:
+#endif /* EPIC_SUPPORT_A2 */
+#ifdef EPIC_SUPPORT_A4
+    case LV_IMG_CF_ALPHA_4BIT:
+#endif /* EPIC_SUPPORT_A4 */
+#ifdef EPIC_SUPPORT_A8
+    case LV_IMG_CF_ALPHA_8BIT:
+#endif /* EPIC_SUPPORT_A8 */
+#ifdef EPIC_SUPPORT_L8
+    case LV_IMG_CF_INDEXED_8BIT:
+#endif /* EPIC_SUPPORT_L8 */
+#ifdef EPIC_SUPPORT_YUV
+    case LV_IMG_CF_YUV422_PACKED_YUYV:
+    case LV_IMG_CF_YUV422_PACKED_UYVY:
+    case LV_IMG_CF_YUV420_PLANAR:
+    case LV_IMG_CF_YUV420_PLANAR2:
+#endif /* EPIC_SUPPORT_YUV */
+#ifdef EPIC_SUPPORT_JPEGD
+    case LV_IMG_CF_JPG:
+#endif
+        ret = true;
+        break;
+
+    default:
+        ret = false;
+        break;
+    }
+
+    return ret;
+}
+
+uint32_t lv_img_2_epic_cf2(uint32_t cf)
+{
+    uint32_t color_mode;
+
+
+    if (LV_IMG_CF_TRUE_COLOR_ALPHA == cf)
+    {
+
+#if LV_COLOR_DEPTH == 16
+        color_mode = EPIC_INPUT_ARGB8565;
+#elif LV_COLOR_DEPTH == 24
+        color_mode = EPIC_INPUT_ARGB8888;
+#else
+        color_mode = EPIC_INPUT_ARGB8888;
+#endif
+    }
+    else if ((LV_IMG_CF_RAW == cf) || (LV_IMG_CF_RAW_ALPHA == cf))
+    {
+        color_mode = EPIC_INPUT_EZIP;
+    }
+    else if (LV_IMG_CF_INDEXED_8BIT == cf)
+    {
+        color_mode = EPIC_INPUT_L8;
+    }
+    else if (LV_IMG_CF_ALPHA_2BIT == cf)
+    {
+        color_mode = EPIC_INPUT_A2;
+    }
+    else if (LV_IMG_CF_ALPHA_4BIT == cf)
+    {
+        color_mode = EPIC_INPUT_A4;
+    }
+    else if (LV_IMG_CF_ALPHA_8BIT == cf)
+    {
+        color_mode = EPIC_INPUT_A8;
+    }
+    else if ((LV_IMG_CF_TRUE_COLOR == cf)  || (LV_IMG_CF_TRUE_COLOR_CHROMA_KEYED == cf))
+    {
+#if LV_COLOR_DEPTH == 16
+        color_mode = EPIC_INPUT_RGB565;
+#elif LV_COLOR_DEPTH == 24
+        color_mode = EPIC_INPUT_RGB888;
+#else
+        color_mode = EPIC_INPUT_ARGB8888;
+#endif
+    }
+    else if (LV_IMG_CF_RGB565 == cf)
+    {
+        color_mode = EPIC_INPUT_RGB565;
+    }
+    else if (LV_IMG_CF_RGBA5658 == cf)
+    {
+        color_mode = EPIC_INPUT_ARGB8565;
+    }
+    else if (LV_IMG_CF_RGB888 == cf)
+    {
+        color_mode = EPIC_INPUT_RGB888;
+    }
+    else if (LV_IMG_CF_RGBA8888 == cf)
+    {
+        color_mode = EPIC_INPUT_ARGB8888;
+    }
+#ifdef EPIC_SUPPORT_YUV   //NOT supported YUV format on lvgl v8
+    else if (LV_IMG_CF_YUV422_PACKED_YUYV == cf)
+    {
+        color_mode = EPIC_INPUT_YUV422_PACKED_YUYV;
+    }
+    else if (LV_IMG_CF_YUV422_PACKED_UYVY == cf)
+    {
+        color_mode = EPIC_INPUT_YUV422_PACKED_UYVY;
+    }
+    else if (LV_IMG_CF_YUV420_PLANAR == cf || LV_IMG_CF_YUV420_PLANAR2 == cf)
+    {
+        color_mode = EPIC_INPUT_YUV420_PLANAR;
+    }
+#endif /* EPIC_SUPPORT_YUV */
+#ifdef EPIC_SUPPORT_JPEGD
+    else if (LV_IMG_CF_JPG == cf)
+    {
+        color_mode = EPIC_INPUT_JPEG;
+    }
+#endif
+
+    else
+    {
+        rt_kprintf("Unknown format %d\r\n", cf);
+        RT_ASSERT(0);
+    }
+
+    return color_mode;
+}
+
+static uint32_t lv_img_2_epic_cf(const lv_img_dsc_t *src)
+{
+    uint32_t color_mode;
+
+
+    if (LV_IMG_CF_TRUE_COLOR_ALPHA == src->header.cf)
+    {
+        if (3 == (src->data_size / src->header.w / src->header.h))
+        {
+            color_mode = EPIC_INPUT_ARGB8565;
+        }
+        else if (4 == (src->data_size / src->header.w / src->header.h))
+        {
+            color_mode = EPIC_INPUT_ARGB8888;
+        }
+        else //Use default
+        {
+            color_mode = lv_img_2_epic_cf2(src->header.cf);
+        }
+    }
+    else if ((LV_IMG_CF_TRUE_COLOR == src->header.cf)  || (LV_IMG_CF_TRUE_COLOR_CHROMA_KEYED == src->header.cf))
+    {
+        if (2 == (src->data_size / src->header.w / src->header.h))
+        {
+            color_mode = EPIC_INPUT_RGB565;
+        }
+        else if (3 == (src->data_size / src->header.w / src->header.h))
+        {
+            color_mode = EPIC_INPUT_RGB888;
+        }
+        else  //Use default
+        {
+            color_mode = lv_img_2_epic_cf2(src->header.cf);
+        }
+    }
+    else
+    {
+        color_mode = lv_img_2_epic_cf2(src->header.cf);
+    }
+
+
+    return color_mode;
+}
+
+
+
+static void lv_area_to_EPIC_area(const lv_area_t *lv_a, EPIC_AreaTypeDef *epic_a)
+{
+    epic_a->x0 = (int16_t)lv_a->x1;
+    epic_a->x1 = (int16_t)lv_a->x2;
+    epic_a->y0 = (int16_t)lv_a->y1;
+    epic_a->y1 = (int16_t)lv_a->y2;
+}
+
+static void invalidate_screen(void *data)
+{
+    lv_obj_invalidate(lv_scr_act());
+}
+extern void set_px_cb_assert(lv_disp_drv_t *disp_drv, uint8_t *buf, lv_coord_t buf_w, lv_coord_t x, lv_coord_t y,
+                             lv_color_t color, lv_opa_t opa);
+static uint32_t get_refreshing_disp_buf_cf(void)
+{
+    lv_disp_t *disp    = _lv_refr_get_disp_refreshing();
+    lv_disp_drv_t *disp_drv = disp->driver;
+
+    if (set_px_cb_rgb565 == disp_drv->set_px_cb)
+        return LV_IMG_CF_RGB565;
+    else if (set_px_true_color_alpha == disp_drv->set_px_cb)
+        return LV_IMG_CF_TRUE_COLOR_ALPHA;
+    else if ((NULL == disp_drv->set_px_cb) || (set_px_cb_assert == disp_drv->set_px_cb))
+        return LV_IMG_CF_TRUE_COLOR;
+    else
+        return LV_IMG_CF_UNKNOWN;
+}
+static lv_img_cf_t get_draw_buf_cf(lv_draw_ctx_t *draw_ctx)
+{
+    epic_draw_ctx_t *ctx = (epic_draw_ctx_t *)draw_ctx;
+    if (ctx->epic_layer) return ((epic_layer_ctx_t *)ctx->epic_layer)->cf;
+    return get_refreshing_disp_buf_cf();
+}
+static void setup_render_buf(drv_epic_render_buf *p_render_buf, struct _lv_draw_ctx_t *draw_ctx)
+{
+    p_render_buf->cf = lv_img_2_epic_cf2(get_draw_buf_cf(draw_ctx));
+    p_render_buf->data = (uint8_t *)draw_ctx->buf;
+    p_render_buf->area.x0 = draw_ctx->buf_area->x1;
+    p_render_buf->area.y0 = draw_ctx->buf_area->y1;
+    p_render_buf->area.x1 = draw_ctx->buf_area->x2;
+    p_render_buf->area.y1 = draw_ctx->buf_area->y2;
+}
+
+
+static void setup_mask_layer(EPIC_LayerConfigTypeDef *p_mask_layer,
+                             lv_img_cf_t mask_cf, const lv_opa_t *mask_map, const lv_area_t *mask_coords)
+{
+#if defined(EPIC_SUPPORT_MONOCHROME_LAYER)&&defined(EPIC_SUPPORT_MASK)
+    p_mask_layer->data = (uint8_t *)mask_map;
+    p_mask_layer->x_offset = mask_coords->x1;
+    p_mask_layer->y_offset = mask_coords->y1;
+    p_mask_layer->width = lv_area_get_width(mask_coords);
+    p_mask_layer->total_width = p_mask_layer->width;
+    p_mask_layer->height = lv_area_get_height(mask_coords);
+    if (LV_IMG_CF_ALPHA_8BIT == mask_cf)
+        p_mask_layer->color_mode = EPIC_INPUT_A8;
+    else if (LV_IMG_CF_ALPHA_4BIT == mask_cf)
+        p_mask_layer->color_mode = EPIC_INPUT_A4;
+    else
+        LV_ASSERT(false);
+
+    p_mask_layer->ax_mode = ALPHA_BLEND_MASK;
+    uint8_t pixel_size;
+    pixel_size = HAL_EPIC_GetColorDepth(p_mask_layer->color_mode);
+    p_mask_layer->data_size = ((pixel_size * p_mask_layer->total_width * p_mask_layer->height) + 7) >> 3;
+#else
+    LV_ASSERT(0);
+#endif /* EPIC_SUPPORT_MONOCHROME_LAYER&&EPIC_SUPPORT_MASK */
+}
+
+static void setup_fg_layer(EPIC_LayerConfigTypeDef *p_fg_layer,
+                           const lv_img_dsc_t *src, const lv_area_t *src_coords,
+                           int16_t angle, int32_t pitch_x, int32_t pitch_y,
+                           lv_point_t *pivot, lv_opa_t opa, lv_color_t ax_color,
+                           uint16_t src_off_x_frac, uint16_t src_off_y_frac
+                          )
+{
+    uint32_t color_bpp;
+
+    /*
+        if (0 == gpu_fraction)
+        {
+            src_off_x_frac = 0;
+            src_off_y_frac = 0;
+        }
+    */
+    angle = angle % 3600;
+    if (angle < 0)
+    {
+        angle += 3600;
+    }
+
+
+    if (pitch_x < 0)
+        p_fg_layer->transform_cfg.h_mirror = 1;
+    if (pitch_y < 0)
+        p_fg_layer->transform_cfg.v_mirror = 1;
+    pitch_x = pitch_x > 0 ? pitch_x : -pitch_x;
+    pitch_y = pitch_y > 0 ? pitch_y : -pitch_y;
+    p_fg_layer->transform_cfg.angle   = angle;
+    p_fg_layer->transform_cfg.pivot_x = pivot->x;
+    p_fg_layer->transform_cfg.pivot_y = pivot->y;
+    p_fg_layer->transform_cfg.scale_x = pitch_x;
+    p_fg_layer->transform_cfg.scale_y = pitch_y;
+
+    p_fg_layer->alpha = opa;
+    p_fg_layer->x_offset = src_coords->x1;
+    p_fg_layer->y_offset = src_coords->y1;
+
+    p_fg_layer->data = (uint8_t *)src->data;
+    p_fg_layer->color_mode = lv_img_2_epic_cf(src);
+    color_bpp = HAL_EPIC_GetColorDepth(p_fg_layer->color_mode);
+
+    p_fg_layer->width = lv_area_get_width(src_coords);
+    p_fg_layer->total_width = (color_bpp > 8) ? src->header.w : RT_ALIGN(src->header.w, 8 / color_bpp);
+    p_fg_layer->height = lv_area_get_height(src_coords);
+    p_fg_layer->x_offset_frac = src_off_x_frac;
+    p_fg_layer->y_offset_frac = src_off_y_frac;
+
+    p_fg_layer->data_size = src->data_size;
+    if ((LV_IMG_CF_RAW == src->header.cf)
+            || (LV_IMG_CF_RAW_ALPHA == src->header.cf))
+    {
+        /* png image cannot be rotated */
+        RT_ASSERT(0 == angle);
+    }
+    else if ((LV_IMG_CF_ALPHA_2BIT == src->header.cf)
+             || (LV_IMG_CF_ALPHA_4BIT == src->header.cf)
+             || (LV_IMG_CF_ALPHA_8BIT == src->header.cf))
+    {
+
+        lv_color32_t ax_color_u32;
+
+        ax_color_u32.full = lv_color_to32(ax_color);
+        p_fg_layer->color_en = true;
+        p_fg_layer->color_r = ax_color_u32.ch.red;
+        p_fg_layer->color_g = ax_color_u32.ch.green;
+        p_fg_layer->color_b = ax_color_u32.ch.blue;
+    }
+    else if (LV_IMG_CF_TRUE_COLOR_CHROMA_KEYED == src->header.cf)
+    {
+        lv_color32_t chroma_u32;
+        chroma_u32.full = lv_color_to32(LV_COLOR_CHROMA_KEY);
+
+        p_fg_layer->color_en = true;
+
+        p_fg_layer->color_r = chroma_u32.ch.red;
+        p_fg_layer->color_g = chroma_u32.ch.green;
+        p_fg_layer->color_b = chroma_u32.ch.blue;
+
+    }
+#ifdef EPIC_SUPPORT_L8
+    else if (LV_IMG_CF_INDEXED_8BIT == src->header.cf)
+    {
+        const uint8_t *p = src->data;
+        p_fg_layer->lookup_table_size = (uint16_t)(*((uint32_t *)p));
+        p += 4;
+        p_fg_layer->lookup_table = (uint8_t *)p;
+        p += p_fg_layer->lookup_table_size * sizeof(lv_color32_t);
+        p_fg_layer->data = (uint8_t *)p;
+    }
+#endif /* EPIC_SUPPORT_L8 */
+#ifdef EPIC_SUPPORT_YUV
+    else if (LV_IMG_CF_YUV420_PLANAR == src->header.cf)
+    {
+        uint32_t xres = RT_ALIGN(src->header.w, 2);
+        uint32_t yres = RT_ALIGN(src->header.h, 2);
+
+        p_fg_layer->total_width = xres;
+        p_fg_layer->yuv.y_buf = p_fg_layer->data;
+        p_fg_layer->yuv.u_buf = p_fg_layer->yuv.y_buf + xres * yres;
+        p_fg_layer->yuv.v_buf = p_fg_layer->yuv.u_buf + xres * yres / 4;
+
+        p_fg_layer->dither_level = EPIC_YUV420_DITHER_LEVEL_DEFAULT;
+    }
+    else if (LV_IMG_CF_YUV420_PLANAR2 == src->header.cf)
+    {
+        uint8_t **yuv = (uint8_t **)p_fg_layer->data;
+        uint32_t xres = RT_ALIGN(src->header.w, 2);
+        p_fg_layer->total_width = xres;
+        p_fg_layer->yuv.y_buf = yuv[0];
+        p_fg_layer->yuv.u_buf = yuv[1];
+        p_fg_layer->yuv.v_buf = yuv[2];
+
+        p_fg_layer->dither_level = EPIC_YUV420_DITHER_LEVEL_DEFAULT;
+    }
+    else if ((LV_IMG_CF_YUV422_PACKED_YUYV == src->header.cf) || (LV_IMG_CF_YUV422_PACKED_UYVY == src->header.cf))
+    {
+        p_fg_layer->yuv.y_buf = p_fg_layer->data;
+    }
+#endif /* EPIC_SUPPORT_YUV */
+
+}
+
+
+static drv_epic_operation *letter_op = NULL;
+static const void *letter_target;
+
+static lv_area_t letter_clip;
+static bool letter_unclipped;
+#if LV_DRAW_COMPLEX
+static struct
+{
+    bool active;
+    lv_area_t rect;
+    lv_coord_t radius;
+    uint8_t outer;
+} letter_masks[_LV_MASK_MAX_NUM];
+static bool letter_masks_supported = true;
+static bool letter_masks_active;
+#endif
+
+/* Compare values rather than stack parameter addresses: LVGL can reuse them
+ * for another object's clip_corner. Other mask types are not batched. */
+static bool letter_masks_match(void)
+{
+    bool match = true;
+#if LV_DRAW_COMPLEX
+    if (!lv_draw_mask_is_any(NULL))
+    {
+        /* Flush a masked batch once when leaving its mask stack. */
+        match = !letter_masks_active;
+        if (letter_masks_active) memset(letter_masks, 0, sizeof(letter_masks));
+        letter_masks_active = false;
+        letter_masks_supported = true;
+        return match;
+    }
+    letter_masks_active = true;
+    bool supported = true;
+    match = letter_masks_supported;
+    for (uint32_t i = 0; i < _LV_MASK_MAX_NUM; i++)
+    {
+        const _lv_draw_mask_common_dsc_t *param = LV_GC_ROOT(_lv_draw_mask_list[i]).param;
+        bool active = param != NULL;
+        if (letter_masks[i].active != active) match = false;
+        letter_masks[i].active = active;
+        if (!active) continue;
+        if (param->type != LV_DRAW_MASK_TYPE_RADIUS)
+        {
+            supported = false;
+            match = false;
+            continue;
+        }
+        const lv_draw_mask_radius_param_t *radius = (const lv_draw_mask_radius_param_t *)param;
+        if (letter_masks[i].rect.x1 != radius->cfg.rect.x1 ||
+                letter_masks[i].rect.y1 != radius->cfg.rect.y1 ||
+                letter_masks[i].rect.x2 != radius->cfg.rect.x2 ||
+                letter_masks[i].rect.y2 != radius->cfg.rect.y2 ||
+                letter_masks[i].radius != radius->cfg.radius ||
+                letter_masks[i].outer != radius->cfg.outer) match = false;
+        letter_masks[i].rect = radius->cfg.rect;
+        letter_masks[i].radius = radius->cfg.radius;
+        letter_masks[i].outer = radius->cfg.outer;
+    }
+    letter_masks_supported = supported;
+#endif
+    return match;
+}
+static const void *line_target;
+static void letter_blend_reset(void)
+{
+    if (letter_op)
+    {
+        drv_epic_commit_op(letter_op);
+        letter_op = NULL;
+    }
+}
+
+
+static void letter_blend(lv_img_dsc_t *dest, lv_img_dsc_t *src,
+                         const lv_area_t *src_coords, const lv_area_t *dst_coords,
+                         const lv_area_t *output_coords, lv_opa_t opa, lv_color_t ax_color,
+                         lv_img_cf_t mask_cf, const lv_opa_t *mask_map, const lv_area_t *mask_coords)
+{
+    lv_area_t clipped_output; //Clip output_coords by src_coords
+    lv_color32_t ax_color_u32;
+
+    p_line_op = NULL;
+    RT_ASSERT((RT_NULL != src_coords) && (RT_NULL != dst_coords) && (RT_NULL != output_coords));
+
+    if (!_lv_area_intersect(&clipped_output, output_coords, src_coords)) return;
+
+    ax_color_u32.full = lv_color_to32(ax_color);
+    uint32_t color_mode = lv_img_2_epic_cf(src);
+
+    bool masks_match = letter_masks_match();
+    bool glyph_unclipped = _lv_area_is_in(src_coords, output_coords, 0);
+    bool same_clip = letter_clip.x1 == output_coords->x1
+                     && letter_clip.y1 == output_coords->y1
+                     && letter_clip.x2 == output_coords->x2
+                     && letter_clip.y2 == output_coords->y2;
+    /* Joining clips is safe only when it cannot expose clipped glyph pixels.
+     * Parent masks keep their original batch area and coverage snapshot. */
+    bool join_clip = letter_op && letter_unclipped && glyph_unclipped
+                     && !mask_map && !letter_op->mask.data && !lv_draw_mask_is_any(NULL);
+
+    if ((letter_op != NULL)
+            && letter_target == dest->data
+            && masks_match
+            && (same_clip || join_clip)
+            && (letter_op->desc.label.color_mode == color_mode)
+            && (letter_op->desc.label.opa == opa)
+            && (letter_op->desc.label.r == ax_color_u32.ch.red)
+            && (letter_op->desc.label.g == ax_color_u32.ch.green)
+            && (letter_op->desc.label.b == ax_color_u32.ch.blue))
+    {
+        drv_epic_letter_type_t *p_letter = drv_epic_op_alloc_letter(letter_op);
+        RT_ASSERT(p_letter);
+
+        p_letter->data = src->data;
+        LV_AREA_TO_EPIC_AREA(&p_letter->area, src_coords);
+        letter_unclipped = letter_unclipped && glyph_unclipped;
+        if (!same_clip)
+        {
+            _lv_area_join(&letter_clip, &letter_clip, output_coords);
+            LV_AREA_TO_EPIC_AREA(&letter_op->clip_area, &letter_clip);
+        }
+    }
+    else
+    {
+        letter_blend_reset();
+
+        RT_ASSERT(NULL == letter_op);
+
+        drv_epic_render_buf dst_buf;
+        dst_buf.cf = lv_img_2_epic_cf2(dest->header.cf);
+        dst_buf.data = (uint8_t *)dest->data;
+        dst_buf.area.x0 = dst_coords->x1;
+        dst_buf.area.y0 = dst_coords->y1;
+        dst_buf.area.x1 = dst_buf.area.x0 + dest->header.w - 1;
+        dst_buf.area.y1 = dst_buf.area.y0 + dest->header.h - 1;
+
+        drv_epic_operation *o = drv_epic_alloc_op(&dst_buf);
+        RT_ASSERT(o != NULL);
+        letter_op = o;
+        letter_target = dest->data;
+        letter_clip = *output_coords;
+        letter_unclipped = glyph_unclipped;
+
+        o->op = DRV_EPIC_DRAW_LETTERS;
+        LV_AREA_TO_EPIC_AREA(&o->clip_area, output_coords);
+
+
+        HAL_EPIC_LayerConfigInit(&o->mask);
+
+        //Setup once only
+        if (mask_map)
+        {
+#if defined(EPIC_SUPPORT_MONOCHROME_LAYER)&&defined(EPIC_SUPPORT_MASK)
+            o->mask.data = (uint8_t *)mask_map;
+            o->mask.x_offset = mask_coords->x1;
+            o->mask.y_offset = mask_coords->y1;
+            o->mask.width = lv_area_get_width(mask_coords);
+            o->mask.total_width = o->mask.width;
+            o->mask.height = lv_area_get_height(mask_coords);
+            if (LV_IMG_CF_ALPHA_8BIT == mask_cf)
+                o->mask.color_mode = EPIC_INPUT_A8;
+            else if (LV_IMG_CF_ALPHA_4BIT == mask_cf)
+                o->mask.color_mode = EPIC_INPUT_A4;
+            else
+                LV_ASSERT(false);
+
+            o->mask.ax_mode = ALPHA_BLEND_MASK;
+            uint8_t pixel_size;
+            pixel_size = HAL_EPIC_GetColorDepth(o->mask.color_mode);
+            o->mask.data_size = ((pixel_size * o->mask.total_width * o->mask.height) + 7) >> 3;
+#else
+            LV_ASSERT(0);
+#endif /* EPIC_SUPPORT_MONOCHROME_LAYER&&EPIC_SUPPORT_MASK */
+
+            lv_gpu_render_mem_lock((void *)mask_map, MEM_ASYN_IMG);
+        }
+
+
+        o->desc.label.p_letters = NULL;
+        o->desc.label.letter_num = 0;
+        o->desc.label.opa = opa;
+        o->desc.label.color_mode = color_mode;
+        if ((LV_IMG_CF_ALPHA_2BIT == src->header.cf)
+                || (LV_IMG_CF_ALPHA_4BIT == src->header.cf)
+                || (LV_IMG_CF_ALPHA_8BIT == src->header.cf))
+        {
+            o->desc.label.r = ax_color_u32.ch.red;
+            o->desc.label.g = ax_color_u32.ch.green;
+            o->desc.label.b = ax_color_u32.ch.blue;
+        }
+        else
+        {
+            LV_ASSERT(0);
+        }
+
+
+
+        drv_epic_letter_type_t *p_letter = drv_epic_op_alloc_letter(o);
+        RT_ASSERT(p_letter);
+
+        p_letter->data = src->data;
+        LV_AREA_TO_EPIC_AREA(&p_letter->area, src_coords);
+        /* Capture the batch clip while the mask stack is still valid. Later
+         * letters with the same stack and clip reuse this operation's mask. */
+        snapshot_parent_mask(o);
+    }
+    lv_gpu_render_mem_lock((void *)src->data, MEM_ASYN_FONT);
+}
+
+
+void img_rotate_opa_frac2(lv_img_dsc_t *dest, lv_img_dsc_t *src, int16_t angle, int32_t pitch_x, int32_t pitch_y,
+                          const lv_area_t *src_coords, const lv_area_t *dst_coords,
+                          const lv_area_t *output_coords, lv_point_t *pivot, lv_opa_t opa, lv_color_t ax_color,
+                          uint16_t src_off_x_frac, uint16_t src_off_y_frac, uint8_t use_dest_as_bg,
+                          lv_img_cf_t mask_cf, const lv_opa_t *mask_map, const lv_area_t *mask_coords)
+{
+    RT_ASSERT(RT_NULL != pivot);
+
+    RT_ASSERT((RT_NULL != src_coords) && (RT_NULL != dst_coords) && (RT_NULL != output_coords));
+
+    lv_area_t res;
+    if (!_lv_area_intersect(&res, dst_coords, output_coords)) return;
+
+
+    drv_epic_render_buf dst_buf;
+    dst_buf.cf = lv_img_2_epic_cf2(dest->header.cf);
+    dst_buf.data = (uint8_t *)dest->data;
+    dst_buf.area.x0 = dst_coords->x1;
+    dst_buf.area.y0 = dst_coords->y1;
+    dst_buf.area.x1 = dst_buf.area.x0 + dest->header.w - 1;
+    dst_buf.area.y1 = dst_buf.area.y0 + dest->header.h - 1;
+
+    letter_blend_reset();
+    p_line_op = NULL;
+    drv_epic_operation *o = drv_epic_alloc_op(&dst_buf);
+    RT_ASSERT(o != NULL);
+
+
+    o->op = DRV_EPIC_DRAW_IMAGE;
+    LV_AREA_TO_EPIC_AREA(&o->clip_area, output_coords);
+
+    HAL_EPIC_LayerConfigInit(&o->mask);
+    if ((mask_map) && (_lv_area_is_on(mask_coords, src_coords)))
+    {
+        setup_mask_layer(&o->mask, mask_cf, mask_map, mask_coords);
+    }
+
+    /*Setup fg layer*/
+    HAL_EPIC_LayerConfigInit(&o->desc.blend.layer);
+    setup_fg_layer(&o->desc.blend.layer,
+                   src, src_coords,
+                   angle, pitch_x, pitch_y,
+                   pivot, opa, ax_color,
+                   src_off_x_frac, src_off_y_frac);
+
+
+    LV_AREA_TO_EPIC_AREA(&o->clip_area, &res);
+    o->desc.blend.use_dest_as_bg = use_dest_as_bg;
+    lv_gpu_render_commit_op(o);
+}
+
+
+static void img_transform(lv_img_dsc_t *dest, const lv_img_dsc_t *src, int16_t angle,
+                          const lv_area_t *src_coords, const lv_area_t *dst_coords,
+                          const lv_area_t *output_coords, lv_opa_t opa, lv_color_t ax_color,
+                          lv_point_t *pivot, lv_coord_t pivot_z,  lv_coord_t src_z, uint16_t src_zoom,
+                          lv_img_cf_t mask_cf, const lv_opa_t *mask_map, const lv_area_t *mask_coords,
+                          uint8_t type, lv_coord_t dst_z, lv_point_t *viewpoint)
+{
+    RT_ASSERT(RT_NULL != pivot);
+
+    RT_ASSERT((RT_NULL != src_coords) && (RT_NULL != dst_coords) && (RT_NULL != output_coords));
+
+    lv_area_t res;
+    if (!_lv_area_intersect(&res, dst_coords, output_coords)) return;
+
+
+    drv_epic_render_buf dst_buf;
+    dst_buf.cf = lv_img_2_epic_cf2(dest->header.cf);
+    dst_buf.data = (uint8_t *)dest->data;
+    dst_buf.area.x0 = dst_coords->x1;
+    dst_buf.area.y0 = dst_coords->y1;
+    dst_buf.area.x1 = dst_buf.area.x0 + dest->header.w - 1;
+    dst_buf.area.y1 = dst_buf.area.y0 + dest->header.h - 1;
+
+    letter_blend_reset();
+    p_line_op = NULL;
+
+    drv_epic_operation *o = drv_epic_alloc_op(&dst_buf);
+    RT_ASSERT(o != NULL);
+
+
+    o->op = DRV_EPIC_DRAW_IMAGE;
+    LV_AREA_TO_EPIC_AREA(&o->clip_area, output_coords);
+
+    HAL_EPIC_LayerConfigInit(&o->mask);
+    if ((mask_map) && (_lv_area_is_on(mask_coords, src_coords)))
+    {
+        setup_mask_layer(&o->mask, mask_cf, mask_map, mask_coords);
+    }
+
+    /*Setup fg layer*/
+    EPIC_LayerConfigTypeDef *p_fg_layer = &o->desc.blend.layer;
+    int32_t pitch_x = LV_IMG_ZOOM_NONE * EPIC_INPUT_SCALE_NONE / (uint32_t)src_zoom;
+    HAL_EPIC_LayerConfigInit(p_fg_layer);
+    setup_fg_layer(p_fg_layer,
+                   src, src_coords,
+                   0, pitch_x, pitch_x,
+                   pivot, opa, ax_color,
+                   0, 0);
+
+    p_fg_layer->transform_cfg.type = type;
+    p_fg_layer->transform_cfg.angle_adv = angle;
+    p_fg_layer->transform_cfg.pivot_z = pivot_z;
+    p_fg_layer->transform_cfg.z_offset = src_z;
+
+    if (!viewpoint)
+    {
+        p_fg_layer->transform_cfg.vp_x_offset = p_fg_layer->transform_cfg.pivot_x;
+        p_fg_layer->transform_cfg.vp_y_offset = p_fg_layer->transform_cfg.pivot_y;
+        p_fg_layer->transform_cfg.dst_z_offset = dst_z;
+    }
+    else
+    {
+        p_fg_layer->transform_cfg.vp_x_offset = viewpoint->x;
+        p_fg_layer->transform_cfg.vp_y_offset = viewpoint->y;
+        p_fg_layer->transform_cfg.dst_z_offset = dst_z;
+    }
+
+
+    LV_AREA_TO_EPIC_AREA(&o->clip_area, &res);
+    o->desc.blend.use_dest_as_bg = true;;
+    lv_gpu_render_commit_op(o);
+}
+#ifdef EPIC_SUPPORT_TRANS_MATRIX
+void gup_set_trans_matrix(const lv_img_dsc_t *dest, const lv_img_dsc_t *src,
+                          const lv_area_t *p_dst_coords,
+                          const lv_area_t *p_draw_area,
+                          sifli_matrix_3x3_t *trans_matrix)
+{
+
+    drv_epic_render_buf dst_buf;
+    dst_buf.cf = lv_img_2_epic_cf2(dest->header.cf);
+    dst_buf.data = (uint8_t *)dest->data;
+    dst_buf.area.x0 = p_dst_coords->x1;
+    dst_buf.area.y0 = p_dst_coords->y1;
+    dst_buf.area.x1 = dst_buf.area.x0 + dest->header.w - 1;
+    dst_buf.area.y1 = dst_buf.area.y0 + dest->header.h - 1;
+
+    letter_blend_reset();
+    p_line_op = NULL;
+
+    drv_epic_operation *o = drv_epic_alloc_op(&dst_buf);
+    RT_ASSERT(o != NULL);
+
+    o->op = DRV_EPIC_DRAW_IMAGE;
+    LV_AREA_TO_EPIC_AREA(&o->clip_area, p_draw_area);
+    HAL_EPIC_LayerConfigInit(&o->mask);
+    lv_area_t area = {0, 0, src->header.w - 1, src->header.h - 1};
+
+    lv_point_t pivot = {0, 0};
+    HAL_EPIC_LayerConfigInit(&o->desc.blend.layer);
+    setup_fg_layer(&o->desc.blend.layer,
+                   src, &area,
+                   0, EPIC_INPUT_SCALE_NONE, EPIC_INPUT_SCALE_NONE,
+                   &pivot, LV_OPA_COVER, LV_COLOR_CHROMA_KEY,
+                   0, 0);
+    sifli_matrix_3x3_t *p_mat = app_calloc(1, sizeof(sifli_matrix_3x3_t));
+    RT_ASSERT(p_mat);
+    *p_mat = *trans_matrix;
+    o->desc.blend.layer.transform_cfg.trans_matrix = p_mat;
+    o->desc.blend.use_dest_as_bg = EPIC_BLEND_MODE_NORMAL;
+    lv_gpu_render_commit_op(o);
+
+}
+
+void img_rotate_matrix(lv_img_dsc_t *dest, const lv_img_dsc_t *src,
+                       const lv_area_t *p_src_coords,
+                       const lv_area_t *p_dst_coords,
+                       const lv_area_t *p_output_coords,
+                       sifli_matrix_4x4_t *pers_mat, float fov,
+                       lv_area_t *p_target_area)
+{
+    sifli_error_t err = SIFLI_MATRIX_SUCCESS;
+
+    RT_ASSERT((RT_NULL != dest) && (RT_NULL != src) && (RT_NULL != pers_mat));
+    RT_ASSERT((RT_NULL != p_src_coords) && (RT_NULL != p_dst_coords) && (RT_NULL != p_output_coords));
+
+    float src_w = lv_area_get_width(p_src_coords);
+    float src_h = lv_area_get_height(p_src_coords);
+    float dst_w = lv_area_get_width(p_dst_coords);
+    float dst_h = lv_area_get_height(p_dst_coords);
+    if ((src_w <= 0) || (src_h <= 0) || (dst_w <= 0) || (dst_h <= 0)) return;
+    //print_matrix_4x4_ext("pers:\n",pers_mat);
+    float w_norm = src_w / dst_h;
+    float h_norm = src_h / dst_h;
+
+    float ofs_x = (dst_w - p_src_coords->x1 - p_src_coords->x2) / dst_h;
+    float ofs_y = (dst_h - p_src_coords->y1 - p_src_coords->y2) / dst_h;
+    //rt_kprintf("ofs_x:%f ofs_y:%f\n",ofs_x,ofs_y);
+
+    sifli_quad_3d_t quad_3d =
+    {
+        {ofs_x - w_norm, ofs_y + h_norm, 0.0f},
+        {ofs_x - w_norm, ofs_y - h_norm, 0.0f},
+        {ofs_x + w_norm, ofs_y - h_norm, 0.0f},
+        {ofs_x + w_norm, ofs_y + h_norm, 0.0f},
+    };
+
+    for (uint32_t i = 0; i < 4; i++)
+    {
+        sifli_mat_vertex_multiply_4x4(pers_mat, &quad_3d[i], &quad_3d[i]);
+        //rt_kprintf("3D i:%d [%f %f %f]\n",i,quad_3d[i].x,quad_3d[i].y,quad_3d[i].z);
+    }
+
+    sifli_matrix_3x3_t trans_matrix;
+    //rt_kprintf("src_w:%f src_h:%f dst_w:%f dst_h:%f \n",src_w, src_h, dst_w, dst_h);
+    err = sifli_get_texture_map_matrix(fov, src_w, src_h, dst_w, dst_h, quad_3d, &trans_matrix);
+    //print_matrix_3x3_ext("tran:\n",trans_matrix);
+    if (SIFLI_MATRIX_SUCCESS != err) return;
+
+    lv_area_t target_area = {LV_COORD_MAX, LV_COORD_MAX, LV_COORD_MIN, LV_COORD_MIN};
+    sifli_quad_2d_t quad_2d =
+    {
+        {0.0f, 0.0f},
+        {0.0f, (float)src_h},
+        {(float)src_w, (float)src_h},
+        {(float)src_w, 0.0f},
+    };
+
+    for (uint32_t i = 0; i < 4; i++)
+    {
+        sifli_mat_vertex_multiply(&trans_matrix, &quad_2d[i].x, &quad_2d[i].y);
+        //rt_kprintf("2D i:%d [%f %f]\n",i,quad_2d[i].x,quad_2d[i].y);
+        target_area.x1 = LV_MIN(target_area.x1, (lv_coord_t)quad_2d[i].x);
+        target_area.y1 = LV_MIN(target_area.y1, (lv_coord_t)quad_2d[i].y);
+        target_area.x2 = LV_MAX(target_area.x2, (lv_coord_t)quad_2d[i].x);
+        target_area.y2 = LV_MAX(target_area.y2, (lv_coord_t)quad_2d[i].y);
+    }
+
+    if (p_target_area)
+    {
+        lv_area_copy(p_target_area, &target_area);
+    }
+    //rt_kprintf("[%d %d %d %d]\n",target_area.x1,target_area.y1,target_area.x2,target_area.y2);
+    lv_area_t draw_area;
+    if (!_lv_area_intersect(&draw_area, &target_area, p_output_coords))
+    {
+        return;
+    }
+    gup_set_trans_matrix(dest, src, p_dst_coords, &draw_area, &trans_matrix);
+}
+
+static void img_rotate_adv2_matrix(lv_img_dsc_t *dest, const lv_img_dsc_t *src, int16_t angle_x, int16_t angle_y,
+                                   const lv_area_t *p_src_coords, const lv_area_t *p_dst_coords, const lv_area_t *p_output_coords,
+                                   float r, float zoom, lv_point_t *viewpoint)
+{
+
+    float src_w = lv_area_get_width(p_src_coords);
+    float src_h = lv_area_get_height(p_src_coords);
+    float dst_w = lv_area_get_width(p_dst_coords);
+    float dst_h = lv_area_get_height(p_dst_coords);
+    if ((src_w <= 0.0f) || (src_h <= 0.0f) || (dst_w <= 0.0f) || (dst_h <= 0.0f)) return;
+    if (zoom < 0.1f)
+    {
+        rt_kprintf("zoom:%f is too small. reset to 0.1f.\n", zoom);
+        zoom = 0.1f;
+    }
+
+    float scale = sifli_get_perspective_scaling_factor(FOV);
+    float dis = scale / zoom;
+
+    //rt_kprintf("dis:%f r:%f angle:%d\n", dis, r, angle);
+
+    sifli_matrix_4x4_t mat;
+    sifli_identity_4x4(&mat);
+    if (viewpoint)
+    {
+        float angle_x = 90 * (viewpoint->y / (float)dst_h - 0.5f) / 2;
+        sifli_translate_4x4(0, 0, -scale, &mat);
+        sifli_rotate_x(-angle_x, &mat);
+        sifli_translate_4x4(0, 0, scale, &mat);
+    }
+
+    sifli_matrix_4x4_t Rcw;
+    sifli_identity_4x4(&Rcw);
+    Rcw.m[2][3] = -dis;
+    sifli_multiply_4x4(&mat, &Rcw);
+
+    r = r / dst_h * 2.0f;
+
+    sifli_matrix_4x4_t obj_mat;
+    sifli_identity_4x4(&obj_mat);
+    sifli_translate_4x4(0, 0, -r, &obj_mat);
+    sifli_rotate_x((float)angle_x / 10.0f, &obj_mat);
+    sifli_rotate_y((float)angle_y / 10.0f, &obj_mat);
+    sifli_translate_4x4(0, 0, r, &obj_mat);
+    sifli_multiply_4x4(&mat, &obj_mat);
+
+    img_rotate_matrix(dest, src, p_src_coords, p_dst_coords, p_output_coords, &mat, FOV, NULL);
+}
+#endif
+
+void img_rotate_adv1(lv_img_dsc_t *dest, const lv_img_dsc_t *src, int16_t angle,
+                     const lv_area_t *p_src_coords, const lv_area_t *p_dst_coords,
+                     const lv_area_t *p_output_coords, lv_opa_t opa, lv_color_t ax_color,
+                     lv_point_t *pivot, lv_coord_t pivot_z,  lv_coord_t src_z, uint16_t src_zoom)
+{
+#ifdef EPIC_SUPPORT_TRANS_MATRIX
+    (void)opa;
+    (void)ax_color;
+    img_rotate_adv2_matrix(dest, src, -angle, 0, p_src_coords, p_dst_coords,
+                           p_output_coords, LV_ABS(pivot_z - src_z), src_zoom / (float)LV_IMG_ZOOM_NONE, NULL);
+#else
+    img_transform(dest, src, angle, p_src_coords, p_dst_coords,
+                  p_output_coords, opa, ax_color, pivot, pivot_z, src_z, src_zoom,
+                  0, NULL, NULL, 1, src_z, NULL);
+#endif
+}
+
+#if LV_DRAW_COMPLEX
+typedef enum
+{
+    PARENT_MASK_CACHE_UNSUPPORTED,
+    PARENT_MASK_CACHE_EMPTY,
+    PARENT_MASK_CACHE_READY,
+} parent_mask_cache_status_t;
+
+/* Build the cache key that identifies the active parent-mask stack.
+ *
+ * The key area is the whole buffer (not the child clip) so operations that
+ * share one parent mask in the same frame collide onto a single entry,
+ * regardless of their individual clip rectangles. Only stacks made purely of
+ * inner (hole-punch) radius masks are cacheable: outer radius masks (e.g.
+ * clip_corner) and non-radius masks make the key unsupported, and an empty
+ * stack means no snapshot is needed at all. */
+static parent_mask_cache_status_t parent_mask_cache_make_key(lv_draw_ctx_t *draw_ctx,
+                                                              parent_mask_key_t *key)
+{
+    if (!draw_ctx->clip_area || !draw_ctx->buf_area || !lv_draw_mask_is_any(NULL))
+        return PARENT_MASK_CACHE_UNSUPPORTED;   /* No draw context or no active mask: caching not applicable */
+
+    /* Child clips must not split a shared parent mask into per-child entries. */
+    key->area = *draw_ctx->buf_area;
+
+    key->mask_count = 0;
+    for (uint32_t i = 0; i < _LV_MASK_MAX_NUM; i++)
+    {
+        const _lv_draw_mask_common_dsc_t *mask = LV_GC_ROOT(_lv_draw_mask_list[i]).param;
+        if (!mask) continue;
+        if (mask->type != LV_DRAW_MASK_TYPE_RADIUS)
+            return PARENT_MASK_CACHE_UNSUPPORTED;   /* Non-radius masks cannot be described by the key */
+
+        const lv_draw_mask_radius_param_t *radius =
+            (const lv_draw_mask_radius_param_t *)mask;
+        if (radius->cfg.outer)
+            return PARENT_MASK_CACHE_UNSUPPORTED;   /* Outer (clip) masks are not cached */
+
+        parent_mask_key_item_t *item = &key->masks[key->mask_count++];
+        item->rect = radius->cfg.rect;
+        item->radius = radius->cfg.radius;
+
+        /* Inner masks only affect pixels inside their rect: trim the snapshot
+         * area to the intersection, or mark everything clipped when empty. */
+        if (!_lv_area_intersect(&key->area, &key->area, &radius->cfg.rect))
+            return PARENT_MASK_CACHE_EMPTY;
+    }
+
+    /* FNV-1a hash over the area and every mask geometry; it only selects a
+     * bucket, exact equality is still verified by parent_mask_key_equal(). */
+    uint32_t hash = 2166136261u;
+    hash = (hash ^ (uint32_t)key->area.x1) * 16777619u;
+    hash = (hash ^ (uint32_t)key->area.y1) * 16777619u;
+    hash = (hash ^ (uint32_t)key->area.x2) * 16777619u;
+    hash = (hash ^ (uint32_t)key->area.y2) * 16777619u;
+    hash = (hash ^ key->mask_count) * 16777619u;
+    for (uint32_t i = 0; i < key->mask_count; i++)
+    {
+        const parent_mask_key_item_t *item = &key->masks[i];
+        hash = (hash ^ (uint32_t)item->rect.x1) * 16777619u;
+        hash = (hash ^ (uint32_t)item->rect.y1) * 16777619u;
+        hash = (hash ^ (uint32_t)item->rect.x2) * 16777619u;
+        hash = (hash ^ (uint32_t)item->rect.y2) * 16777619u;
+        hash = (hash ^ (uint32_t)item->radius) * 16777619u;
+    }
+    key->hash = hash;
+    return key->mask_count ? PARENT_MASK_CACHE_READY : PARENT_MASK_CACHE_UNSUPPORTED;
+}
+
+/* Field-by-field key comparison. The hash only selects a bucket; two keys
+ * are equal only when area, mask count and every mask geometry match. */
+static bool parent_mask_key_equal(const parent_mask_key_t *a, const parent_mask_key_t *b)
+{
+    if (a->hash != b->hash || a->mask_count != b->mask_count ||
+            a->area.x1 != b->area.x1 || a->area.y1 != b->area.y1 ||
+            a->area.x2 != b->area.x2 || a->area.y2 != b->area.y2)
+        return false;
+
+    for (uint32_t i = 0; i < a->mask_count; i++)
+    {
+        const parent_mask_key_item_t *ma = &a->masks[i];
+        const parent_mask_key_item_t *mb = &b->masks[i];
+        if (ma->rect.x1 != mb->rect.x1 || ma->rect.y1 != mb->rect.y1 ||
+                ma->rect.x2 != mb->rect.x2 || ma->rect.y2 != mb->rect.y2 ||
+                ma->radius != mb->radius)
+            return false;
+    }
+
+    return true;
+}
+
+/* Look up the bucket selected by the key hash and scan its chain for an
+ * entry with an exactly equal key. */
+static parent_mask_cache_t *parent_mask_cache_find(const parent_mask_key_t *key)
+{
+    uint32_t bucket = key->hash % PARENT_MASK_CACHE_BUCKET_COUNT;
+    for (parent_mask_cache_t *cache = parent_mask_cache_buckets[bucket]; cache; cache = cache->next)
+    {
+        if (parent_mask_key_equal(&cache->key, key)) return cache;
+    }
+    return NULL;
+}
+
+/* Acquire a cached coverage for the key, generating it on first use.
+ *
+ * Lookup and bucket insertion are protected by a critical section (scheduler
+ * locked) because operations may be committed from different threads. The
+ * expensive row-by-row mask evaluation runs outside the critical section; a
+ * re-check after generation drops the local candidate if another thread has
+ * inserted the same key in the meantime. */
+static parent_mask_cache_t *parent_mask_cache_get(const parent_mask_key_t *key)
+{
+    rt_enter_critical();                       /* Serialize cache access (find + ref count) */
+    parent_mask_cache_t *cache = parent_mask_cache_find(key);
+    if (cache)
+    {
+        RT_ASSERT(cache->ref_count < UINT32_MAX);
+        cache->ref_count++;                    /* Hit: one more operation shares the coverage */
+        rt_exit_critical();
+        return cache;
+    }
+    rt_exit_critical();
+
+    /* Miss: compute the coverage area size. */
+    int32_t width = lv_area_get_width(&key->area);
+    int32_t height = lv_area_get_height(&key->area);
+    if (width <= 0 || height <= 0 || (size_t)width > SIZE_MAX / (size_t)height)
+        return NULL;
+
+    size_t size = (size_t)width * height;
+    if (size > UINT32_MAX) return NULL;
+
+    parent_mask_cache_t *candidate = app_calloc(1, sizeof(*candidate));
+    if (!candidate) return NULL;
+    candidate->coverage = app_cache_alloc(size, IMAGE_CACHE_PSRAM);
+    if (!candidate->coverage)
+    {
+        app_free(candidate);
+        return NULL;
+    }
+    candidate->key = *key;
+
+    /* Evaluate the mask stack once, row by row, into the A8 coverage. */
+    memset(candidate->coverage, 255, size);
+    for (int32_t row = 0; row < height; row++)
+    {
+        uint8_t *line = candidate->coverage + row * width;
+        if (lv_draw_mask_apply(line, key->area.x1, key->area.y1 + row, width) ==
+                LV_DRAW_MASK_RES_TRANSP)
+            memset(line, 0, width);
+    }
+
+    rt_enter_critical();                       /* Re-check: another thread may have inserted it */
+    cache = parent_mask_cache_find(key);
+    if (cache)
+    {
+        RT_ASSERT(cache->ref_count < UINT32_MAX);
+        cache->ref_count++;
+        rt_exit_critical();
+        app_cache_free(candidate->coverage);   /* Keep the existing entry, drop the duplicate */
+        app_free(candidate);
+        return cache;
+    }
+
+    candidate->ref_count = 1;                  /* First reference: insert into the bucket */
+    uint32_t bucket = key->hash % PARENT_MASK_CACHE_BUCKET_COUNT;
+    candidate->next = parent_mask_cache_buckets[bucket];
+    parent_mask_cache_buckets[bucket] = candidate;
+    rt_exit_critical();
+    return candidate;
+}
+
+/* Drop one reference. When the last reference is released, unlink the entry
+ * from its bucket (inside the critical section) and free the coverage buffer
+ * and the entry itself (outside it, so the allocator is never called while
+ * the scheduler is locked). */
+static void parent_mask_cache_release(parent_mask_cache_t *cache)
+{
+    bool release = false;
+
+    rt_enter_critical();
+    RT_ASSERT(cache->ref_count > 0);
+    if (--cache->ref_count == 0)
+    {
+        uint32_t bucket = cache->key.hash % PARENT_MASK_CACHE_BUCKET_COUNT;
+        parent_mask_cache_t **link = &parent_mask_cache_buckets[bucket];
+        while (*link && *link != cache) link = &(*link)->next;
+        RT_ASSERT(*link == cache);
+        if (*link == cache)
+        {
+            *link = cache->next;
+            release = true;
+        }
+    }
+    rt_exit_critical();
+
+    if (release)
+    {
+        app_cache_free(cache->coverage);
+        app_free(cache);
+    }
+}
+#endif
+
+void img_rotate_adv2(lv_img_dsc_t *dest, const lv_img_dsc_t *src, int16_t angle,
+                     const lv_area_t *p_src_coords, const lv_area_t *p_dst_coords,
+                     const lv_area_t *p_output_coords, lv_opa_t opa, lv_color_t ax_color,
+                     lv_point_t *pivot, lv_coord_t pivot_z,  lv_coord_t src_z, uint16_t src_zoom)
+{
+#ifdef EPIC_SUPPORT_TRANS_MATRIX
+    (void)opa;
+    (void)ax_color;
+    img_rotate_adv2_matrix(dest, src, 0, -angle, p_src_coords, p_dst_coords,
+                           p_output_coords, LV_ABS(pivot_z - src_z), src_zoom / (float)LV_IMG_ZOOM_NONE,
+                           NULL);
+#else
+    img_transform(dest, src, angle, p_src_coords, p_dst_coords,
+                  p_output_coords, opa, ax_color, pivot, pivot_z, src_z, src_zoom,
+                  0, NULL, NULL, 2, src_z, NULL);
+#endif
+}
+
+void img_rotate_adv2_vp(lv_img_dsc_t *dest, const lv_img_dsc_t *src, int16_t angle,
+                        const lv_area_t *p_src_coords, const lv_area_t *p_dst_coords,
+                        const lv_area_t *p_output_coords, lv_opa_t opa, lv_color_t ax_color,
+                        lv_point_t *pivot, lv_coord_t pivot_z, lv_coord_t src_z, uint16_t src_zoom,
+                        lv_coord_t dst_z, lv_point_t *viewpoint, lv_area_t *src_new_area)
+{
+    LV_UNUSED(src_new_area);
+#ifdef EPIC_SUPPORT_TRANS_MATRIX
+    (void)opa;
+    (void)ax_color;
+    int32_t r = LV_ABS(src_z - pivot_z);
+    float zoom = dst_z / (float)src_z;
+    if (angle > -900 && angle < 900 || src_new_area)
+    {
+        angle = -angle;
+    }
+    else
+    {
+        angle = 1800 - angle;
+        r = -r;
+        zoom = dst_z / (float)(2 * pivot_z - src_z);
+    }
+
+    img_rotate_adv2_matrix(dest, src, 0, angle, p_src_coords, p_dst_coords,
+                           p_output_coords, r, zoom,
+                           viewpoint);
+#else
+    img_transform(dest, src, angle, p_src_coords, p_dst_coords,
+                  p_output_coords, opa, ax_color, pivot, pivot_z, src_z, src_zoom,
+                  0, NULL, NULL, 2, dst_z, viewpoint);
+#endif
+}
+
+
+
+extern void HAL_EPIC_Adv_Log(uint32_t level);
+void lv_gpu_adv_log(uint32_t level)
+{
+    HAL_EPIC_Adv_Log(level);
+}
+
+static void img_rotate_opa_frac(lv_img_dsc_t *dest, lv_img_dsc_t *src, int16_t angle, uint32_t zoom,
+                                const lv_area_t *src_coords, const lv_area_t *dst_coords,
+                                const lv_area_t *output_coords, lv_point_t *pivot, lv_opa_t opa, lv_color_t ax_color,
+                                uint16_t src_off_x_frac, uint16_t src_off_y_frac,
+                                lv_img_cf_t mask_cf, const lv_opa_t *mask_map, const lv_area_t *mask_coords)
+{
+    int32_t pitch;
+
+    //To epic scale
+    pitch = LV_IMG_ZOOM_NONE * EPIC_INPUT_SCALE_NONE / (uint32_t)zoom;
+
+    img_rotate_opa_frac2(dest, src, angle, pitch, pitch,
+                         src_coords, dst_coords,
+                         output_coords, pivot, opa, ax_color,
+                         src_off_x_frac, src_off_y_frac, 1,
+                         mask_cf, mask_map, mask_coords);
+}
+
+
+static void draw_img(struct _lv_draw_ctx_t *draw_ctx,
+                     const lv_draw_img_dsc_t *draw_dsc,
+                     const lv_area_t *src_area, //Src buf coordinates
+                     lv_img_decoder_dsc_t *src_dsc)
+
+{
+    lv_img_cf_t cf = src_dsc->header.cf;
+
+    //lv_area_t clipped_coords;
+    // if (!_lv_area_intersect(&clipped_coords, &src_area, draw_ctx->clip_area)) return;
+
+    lv_draw_mask_map_param_t mask_param;
+    lv_img_cf_t mask_cf;
+    const lv_opa_t *mask_map;
+    lv_area_t mask_coords;
+    if (lv_draw_mask_is_only_map_mask(draw_ctx->buf_area, &mask_param))
+    {
+        LV_ASSERT(LV_DRAW_MASK_TYPE_MAP == mask_param.dsc.type);
+
+        mask_coords = mask_param.cfg.coords;
+
+        //lv_area_move(&mask_coords, src_area->x1, src_area->y1);
+
+        PRINT_AREA("scr_buf", draw_ctx->buf_area);
+        PRINT_AREA("scr_clip", draw_ctx->clip_area);
+        PRINT_AREA("src_area", src_area);
+        PRINT_AREA("msk_area", &mask_coords);
+
+        mask_map = mask_param.cfg.map;
+        mask_cf  = LV_IMG_CF_ALPHA_8BIT;
+    }
+    else
+    {
+        mask_map = NULL;
+    }
+
+#if LV_USE_GPU
+    if (EPIC_SUPPORTED_CF(cf))
+    {
+        lv_img_dsc_t src;
+        lv_img_dsc_t dest;
+
+
+        //my_gpu_wait(draw_ctx);
+
+        src.data = src_dsc->img_data;
+        src.data_size = src_dsc->img_data_size;
+        memcpy(&src.header, &src_dsc->header, sizeof(lv_img_header_t));
+
+
+
+        dest.data = draw_ctx->buf;
+        dest.header.w = lv_area_get_width(draw_ctx->buf_area);
+        dest.header.h = lv_area_get_height(draw_ctx->buf_area);
+        dest.header.cf = get_draw_buf_cf(draw_ctx);
+        dest.data_size = lv_img_buf_get_img_size(dest.header.w, dest.header.h, dest.header.cf);
+        dest.header.always_zero = 0;
+
+        lv_opa_t opa = (cf == LV_IMG_CF_ALPHA_1BIT || \
+                        cf == LV_IMG_CF_ALPHA_2BIT || \
+                        cf == LV_IMG_CF_ALPHA_4BIT || \
+                        cf == LV_IMG_CF_ALPHA_8BIT) ? draw_dsc->recolor_opa : draw_dsc->opa;
+
+        {
+            img_rotate_opa_frac(&dest, &src, draw_dsc->angle, (uint32_t)draw_dsc->zoom,
+                                src_area, draw_ctx->buf_area,
+                                draw_ctx->clip_area, (lv_point_t *) & (draw_dsc->pivot), opa, draw_dsc->recolor,
+                                draw_dsc->coord_x_frac, draw_dsc->coord_y_frac,
+                                mask_cf, mask_map, &mask_coords);
+
+            return;
+        }
+
+
+    }
+#endif  /* LV_USE_GPU */
+
+}
+
+
+/**
+* Draw a letter in the Virtual Display Buffer
+* @param pos_p left-top coordinate of the latter
+* @param mask_p the letter will be drawn only on this area  (truncated to draw_buf area)
+* @param font_p pointer to font
+* @param letter a letter to draw
+* @param color color of letter
+* @param opa opacity of letter (0..255)
+*/
+static void draw_letter(lv_draw_ctx_t *draw_ctx, const lv_draw_label_dsc_t *dsc,  const lv_point_t *pos_p,
+                        uint32_t letter)
+{
+    lv_font_glyph_dsc_t g;
+    bool g_ret = lv_font_get_glyph_dsc(dsc->font, &g, letter, '\0');
+    if (g_ret == false)
+    {
+        /*Add warning if the dsc is not found
+         *but do not print warning for non printable ASCII chars (e.g. '\n')*/
+        if (letter >= 0x20 &&
+                letter != 0xf8ff && /*LV_SYMBOL_DUMMY*/
+                letter != 0x200c)   /*ZERO WIDTH NON-JOINER*/
+        {
+            LV_LOG_WARN("lv_draw_letter: glyph dsc. not found for U+%" PRIX32, letter);
+
+#if LV_USE_FONT_PLACEHOLDER
+            /* draw placeholder */
+            lv_area_t glyph_coords;
+            lv_draw_rect_dsc_t glyph_dsc;
+            lv_coord_t begin_x = pos_p->x + g.ofs_x;
+            lv_coord_t begin_y = pos_p->y + g.ofs_y;
+            lv_area_set(&glyph_coords, begin_x, begin_y, begin_x + g.box_w, begin_y + g.box_h);
+            lv_draw_rect_dsc_init(&glyph_dsc);
+            glyph_dsc.bg_opa = LV_OPA_MIN;
+            glyph_dsc.outline_opa = LV_OPA_MIN;
+            glyph_dsc.shadow_opa = LV_OPA_MIN;
+            glyph_dsc.bg_img_opa = LV_OPA_MIN;
+            glyph_dsc.border_color = dsc->color;
+            glyph_dsc.border_width = 1;
+            draw_ctx->draw_rect(draw_ctx, &glyph_dsc, &glyph_coords);
+#endif
+        }
+        return;
+    }
+
+    /*Don't draw anything if the character is empty. E.g. space*/
+    if ((g.box_h == 0) || (g.box_w == 0)) return;
+
+    lv_point_t gpos;
+    gpos.x = pos_p->x + g.ofs_x;
+    gpos.y = pos_p->y + (dsc->font->line_height - dsc->font->base_line) - g.box_h - g.ofs_y;
+
+    /*If the letter is completely out of mask don't draw it*/
+    if (gpos.x + g.box_w < draw_ctx->clip_area->x1 ||
+            gpos.x > draw_ctx->clip_area->x2 ||
+            gpos.y + g.box_h < draw_ctx->clip_area->y1 ||
+            gpos.y > draw_ctx->clip_area->y2)
+    {
+        return;
+    }
+
+    const uint8_t *map_p = lv_font_get_glyph_bitmap(g.resolved_font, letter);
+    if (map_p == NULL)
+    {
+        LV_LOG_WARN("lv_draw_letter: character's bitmap not found");
+        return;
+    }
+
+
+
+
+
+    uint32_t bpp = g.bpp;
+    if (bpp == 3) bpp = 4;
+
+
+
+#if defined(SOC_SF32LB56X)||defined(SOC_SF32LB58X)
+    const uint32_t gpu_support_min_bpp = 4;
+#else
+    const uint32_t gpu_support_min_bpp = 2;
+#endif /* SOC_SF32LB56X || SOC_SF32LB58X*/
+
+    lv_disp_t *disp = _lv_refr_get_disp_refreshing();
+
+    if ((LV_BLEND_MODE_NORMAL == dsc->blend_mode)
+            && (bpp >= gpu_support_min_bpp)
+            && (0 == g.resolved_font->subpx)
+       )
+    {
+        lv_img_cf_t mask_cf;
+        const lv_opa_t *mask_map;
+        lv_area_t mask_coords;
+        lv_draw_mask_map_param_t mask_param;
+
+        lv_area_t letter_area;
+
+        letter_area.x1 = gpos.x;
+        letter_area.y1 = gpos.y;
+        letter_area.x2 = letter_area.x1 + g.box_w - 1;
+        letter_area.y2 = letter_area.y1 + g.box_h - 1;
+
+        if (lv_draw_mask_is_only_map_mask(draw_ctx->clip_area, &mask_param))
+        {
+            LV_DEBUG_ASSERT((LV_DRAW_MASK_TYPE_MAP == mask_param.dsc.type), "type:%llu", mask_param.dsc.type);
+
+            mask_coords = mask_param.cfg.coords;
+
+            //lv_area_move(&mask_coords, src_area->x1, src_area->y1);
+//
+//            PRINT_AREA("scr_buf", disp_area);
+//            PRINT_AREA("scr_clip", clip_area);
+//            PRINT_AREA("src_area", letter_area);
+//            PRINT_AREA("msk_area", &mask_coords);
+
+            mask_map = mask_param.cfg.map;
+            mask_cf  = LV_IMG_CF_ALPHA_8BIT;
+        }
+        else
+        {
+            mask_map = NULL;
+        }
+
+
+        lv_img_dsc_t src;
+        lv_img_dsc_t dest;
+        lv_point_t pivot = {0, 0};
+
+
+
+        switch (bpp)
+        {
+        case 2:
+            src.header.cf = LV_IMG_CF_ALPHA_2BIT;
+            break;
+        case 4:
+            src.header.cf = LV_IMG_CF_ALPHA_4BIT;
+            break;
+        case 8:
+            src.header.cf = LV_IMG_CF_ALPHA_8BIT;
+            break;       /*No opa table, pixel value will be used directly*/
+
+        default:
+            RT_ASSERT(0);
+        }
+//print_letter_map(letter, map_p,g.box_w,g.box_h,bpp);
+
+// #undef PRINT_AREA
+//#define PRINT_AREA(s,area) rt_kprintf("%s \t x1y1=%d,%d  x2y2=%d,%d  \n",s,(area)->x1,(area)->y1,(area)->x2,(area)->y2)
+
+
+//PRINT_AREA("src_area", &letter_area);
+        src.data = map_p;
+        src.header.w = g.box_w;
+        src.header.h = g.box_h;
+        src.data_size = (RT_ALIGN(src.header.w * bpp, 8) >> 3)  * src.header.h;
+        src.header.always_zero = 0;
+
+        dest.data = draw_ctx->buf;
+        dest.header.always_zero = 0;
+        dest.header.w = lv_area_get_width(draw_ctx->buf_area);
+        dest.header.h = lv_area_get_height(draw_ctx->buf_area);
+        dest.header.cf = get_draw_buf_cf(draw_ctx);
+        dest.data_size = lv_img_buf_get_img_size(dest.header.w, dest.header.h, dest.header.cf);
+
+        letter_blend(&dest, &src,
+                     &letter_area, draw_ctx->buf_area,
+                     draw_ctx->clip_area, dsc->opa, dsc->color,
+                     mask_cf, mask_map, &mask_coords);
+
+
+
+        return;
+    }
+
+
+
+
+
+
+
+//Not support by EPIC, call sw rendering
+    LV_ASSERT(0);
+}
+
+
+static void my_draw_cleanup(_lv_img_cache_entry_t *cache)
+{
+    /*Automatically close images with no caching*/
+#if LV_IMG_CACHE_DEF_SIZE == 0
+    lv_img_decoder_close(&cache->dec_dsc);
+#else
+    LV_UNUSED(cache);
+#endif
+}
+
+/* Snapshot as L8: a uint32_t palette count, two BGRA entries, then byte indices.
+ * The caller owns the returned buffer until the queued image is consumed. */
+static uint8_t *indexed1_snapshot(const lv_img_dsc_t *src)
+{
+    uint32_t w = src->header.w, h = src->header.h;
+    uint32_t stride = (w + 7) / 8;
+    uint32_t palette_size = 2;
+    uint32_t header_size = sizeof(palette_size) + palette_size * sizeof(lv_color32_t);
+    if (!src->data || !w || !h || w > (UINT32_MAX - header_size) / h ||
+            src->data_size < 8 + stride * h) return NULL;
+    uint8_t *snapshot = app_cache_alloc(header_size + w * h, IMAGE_CACHE_PSRAM);
+    if (!snapshot) return NULL;
+    memcpy(snapshot, &palette_size, sizeof(palette_size));
+    memcpy(snapshot + sizeof(palette_size), src->data, palette_size * sizeof(lv_color32_t));
+    uint8_t *pixels = snapshot + header_size;
+    const uint8_t *bits = src->data + 8;
+    for (uint32_t y = 0; y < h; y++)
+    {
+        for (uint32_t x = 0; x < w; x++)
+        {
+            uint32_t index = (bits[y * stride + x / 8] >> (7 - x % 8)) & 1;
+            pixels[y * w + x] = (uint8_t)index;
+        }
+    }
+    return snapshot;
+}
+
+static lv_res_t draw_indexed1(lv_draw_ctx_t *ctx, const lv_draw_img_dsc_t *dsc,
+                              const lv_area_t *coords, const lv_img_dsc_t *src)
+{
+    if (!dsc->zoom) return LV_RES_OK;
+    lv_area_t bounds, clip;
+    _lv_img_buf_get_transformed_area(&bounds, src->header.w, src->header.h,
+                                    dsc->angle, dsc->zoom, &dsc->pivot);
+    lv_area_move(&bounds, coords->x1, coords->y1);
+    if (!_lv_area_intersect(&clip, &bounds, ctx->clip_area) ||
+            !_lv_area_intersect(&clip, &clip, ctx->buf_area)) return LV_RES_OK;
+    uint8_t *snapshot = indexed1_snapshot(src);
+    if (!snapshot)
+    {
+        LV_LOG_WARN("Cannot create indexed 1-bit image snapshot");
+        return LV_RES_INV;
+    }
+    letter_blend_reset();
+    p_line_op = NULL;
+    drv_epic_render_buf dst;
+    setup_render_buf(&dst, ctx);
+    drv_epic_operation *op = drv_epic_alloc_op(&dst);
+    RT_ASSERT(op);
+    op->op = DRV_EPIC_DRAW_IMAGE;
+    LV_AREA_TO_EPIC_AREA(&op->clip_area, &clip);
+    lv_img_dsc_t image = *src;
+    image.header.cf = LV_IMG_CF_INDEXED_8BIT;
+    image.data = snapshot;
+    image.data_size = sizeof(uint32_t) + 2 * sizeof(lv_color32_t) +
+                      (uint32_t)src->header.w * src->header.h;
+    HAL_EPIC_LayerConfigInit(&op->desc.blend.layer);
+    lv_point_t pivot = dsc->pivot;
+    int32_t pitch = (uint32_t)LV_IMG_ZOOM_NONE * EPIC_INPUT_SCALE_NONE / dsc->zoom;
+    setup_fg_layer(&op->desc.blend.layer, &image, coords, dsc->angle,
+                   pitch, pitch, &pivot, dsc->opa, dsc->recolor,
+                   dsc->coord_x_frac, dsc->coord_y_frac);
+    op->desc.blend.layer.data_size = (uint32_t)src->header.w * src->header.h;
+    op->desc.blend.use_dest_as_bg = EPIC_BLEND_MODE_NORMAL;
+    op->desc.blend.layer_owned = 1;
+    lv_gpu_render_commit_op(op);
+    return LV_RES_OK;
+}
+
+/*
+    This function is copied from decode_and_draw() at lv_draw_img.c
+*/
+static lv_res_t my_decode_and_draw(lv_draw_ctx_t *draw_ctx, const lv_draw_img_dsc_t *draw_dsc,
+                                   const lv_area_t *coords, const void *src)
+{
+    if (draw_dsc->opa <= LV_OPA_MIN) return LV_RES_OK;
+
+    /* Canvas data is mutable: bypass the decoder cache and snapshot each draw. */
+    if (lv_img_src_get_type(src) == LV_IMG_SRC_VARIABLE &&
+            ((const lv_img_dsc_t *)src)->header.cf == LV_IMG_CF_INDEXED_1BIT)
+        return draw_indexed1(draw_ctx, draw_dsc, coords, src);
+
+    _lv_img_cache_entry_t *cdsc = _lv_img_cache_open(src, draw_dsc->recolor, draw_dsc->frame_id);
+
+
+    if (cdsc == NULL || (!EPIC_SUPPORTED_CF(cdsc->dec_dsc.header.cf)) || (cdsc->dec_dsc.error_msg != NULL))
+    {
+        LV_LOG_WARN("Image draw error");
+
+        //show_error(draw_ctx, coords, cdsc->dec_dsc.error_msg);
+    }
+    /*The decoder could open the image and gave the entire uncompressed image.
+     *Just draw it!*/
+    else if (cdsc->dec_dsc.img_data)
+    {
+        lv_area_t map_area_rot;
+        lv_area_copy(&map_area_rot, coords);
+        if (draw_dsc->angle || draw_dsc->zoom != LV_IMG_ZOOM_NONE)
+        {
+            int32_t w = lv_area_get_width(coords);
+            int32_t h = lv_area_get_height(coords);
+
+            _lv_img_buf_get_transformed_area(&map_area_rot, w, h, draw_dsc->angle, draw_dsc->zoom, &draw_dsc->pivot);
+
+            map_area_rot.x1 += coords->x1;
+            map_area_rot.y1 += coords->y1;
+            map_area_rot.x2 += coords->x1;
+            map_area_rot.y2 += coords->y1;
+        }
+
+        lv_area_t clip_com; /*Common area of mask and coords*/
+        bool union_ok;
+        union_ok = _lv_area_intersect(&clip_com, draw_ctx->clip_area, &map_area_rot);
+        /*Out of mask. There is nothing to draw so the image is drawn successfully.*/
+        if (union_ok == false)
+        {
+            my_draw_cleanup(cdsc);
+            return LV_RES_OK;
+        }
+
+        const lv_area_t *saved_clip = draw_ctx->clip_area;
+        draw_ctx->clip_area = &clip_com;
+        draw_img(draw_ctx, draw_dsc, coords, &cdsc->dec_dsc);
+        draw_ctx->clip_area = saved_clip;
+    }
+
+
+    my_draw_cleanup(cdsc);
+    return LV_RES_OK;
+}
+
+
+static void draw_blend(lv_draw_ctx_t *draw_ctx, const lv_draw_sw_blend_dsc_t *dsc)
+{
+    /*Let's get the blend area which is the intersection of the area to fill and the clip area.*/
+    lv_area_t blend_area;
+    if (!_lv_area_intersect(&blend_area, dsc->blend_area, draw_ctx->clip_area)) return; /*Fully clipped, nothing to do*/
+
+    LV_ASSERT(0);
+}
+
+#if LV_DRAW_COMPLEX
+/** Return true only when a mask leaves every pixel in the area opaque. */
+static bool mask_area_is_full_cover(const _lv_draw_mask_common_dsc_t *param, const lv_area_t *area)
+{
+    if (param->type == LV_DRAW_MASK_TYPE_RADIUS)
+    {
+        const lv_draw_mask_radius_param_t *radius = (const lv_draw_mask_radius_param_t *)param;
+        const lv_area_t *rect = &radius->cfg.rect;
+        if (radius->cfg.outer) return !_lv_area_is_on(area, rect);
+        if (!_lv_area_is_in(area, rect, 0)) return false;
+
+        /* Curved edges can contain antialiased pixels despite geometric containment. */
+        int32_t r = radius->cfg.radius;
+        return (area->y1 >= rect->y1 + r && area->y2 <= rect->y2 - r) ||
+               (area->x1 >= rect->x1 + r && (int32_t)area->x2 + 1 <= rect->x2 - r);
+    }
+
+    if (param->type == LV_DRAW_MASK_TYPE_ANGLE)
+    {
+        const lv_draw_mask_angle_param_t *angle = (const lv_draw_mask_angle_param_t *)param;
+        /* A reflex sector is not convex: opaque corners do not prove opaque contents. */
+        if (angle->delta_deg > 180) return false;
+    }
+    else if (param->type != LV_DRAW_MASK_TYPE_LINE)
+    {
+        return false;
+    }
+
+    /* Keep a one-pixel guard around convex masks: isolated corner samples can
+     * take different AA shortcuts from a complete scanline in LVGL. */
+    if (area->x1 <= LV_COORD_MIN || area->y1 <= LV_COORD_MIN ||
+            area->x2 >= LV_COORD_MAX || area->y2 >= LV_COORD_MAX) return false;
+    const lv_point_t corners[] = {
+        {area->x1, area->y1}, {area->x2, area->y1},
+        {area->x1, area->y2}, {area->x2, area->y2}
+    };
+    for (uint32_t i = 0; i < sizeof(corners) / sizeof(corners[0]); i++)
+    {
+        for (int32_t y = corners[i].y - 1; y <= corners[i].y + 1; y++)
+        {
+            lv_opa_t coverage[3] = {LV_OPA_COVER, LV_OPA_COVER, LV_OPA_COVER};
+            if (param->cb(coverage, corners[i].x - 1, y, 3, (void *)param) !=
+                    LV_DRAW_MASK_RES_FULL_COVER)
+                return false;
+        }
+    }
+    return true;
+}
+
+/** Check the active stack before allocating an A8 parent-mask snapshot. */
+static bool parent_mask_needs_snapshot(const lv_area_t *area)
+{
+    for (uint32_t i = 0; i < _LV_MASK_MAX_NUM; i++)
+    {
+        const _lv_draw_mask_common_dsc_t *param = LV_GC_ROOT(_lv_draw_mask_list[i]).param;
+        if (param && !mask_area_is_full_cover(param, area)) return true;
+    }
+    return false;
+}
+#endif
+
+/* Decode the rectangle background image and configure the EPIC foreground
+ * layer. Parent masks are attached to the RECT operation at commit time. */
+static __NOINLINE drv_epic_rect_image_t *bg_image_prepare(lv_draw_ctx_t *draw_ctx,
+        const lv_draw_rect_dsc_t *dsc, const lv_area_t *coords)
+{
+    if (!dsc->bg_img_src || dsc->bg_img_opa <= LV_OPA_MIN ||
+            lv_img_src_get_type(dsc->bg_img_src) == LV_IMG_SRC_SYMBOL) return NULL;
+    if (dsc->blend_mode != LV_BLEND_MODE_NORMAL)
+    {
+        LV_LOG_WARN("Background image blend mode unsupported");
+        return NULL;
+    }
+    /* Clip to the visible part of the frame buffer. */
+    lv_area_t clip;
+    if (!_lv_area_intersect(&clip, coords, draw_ctx->clip_area) ||
+            !_lv_area_intersect(&clip, &clip, draw_ctx->buf_area)) return NULL;
+
+    _lv_img_cache_entry_t *cache = _lv_img_cache_open(dsc->bg_img_src, dsc->bg_img_recolor, 0);
+    if (!cache)
+    {
+        LV_LOG_WARN("Couldn't open the background image");
+        return NULL;
+    }
+    lv_img_decoder_dsc_t *decoded = &cache->dec_dsc;
+    drv_epic_rect_image_t *image = NULL;
+    if (decoded->error_msg || !decoded->img_data || !decoded->img_data_size ||
+            !decoded->header.w || !decoded->header.h || !EPIC_SUPPORTED_CF(decoded->header.cf)) goto done;
+    switch (decoded->header.cf)
+    {
+    case LV_IMG_CF_TRUE_COLOR:
+    case LV_IMG_CF_TRUE_COLOR_ALPHA:
+    case LV_IMG_CF_TRUE_COLOR_CHROMA_KEYED:
+    case LV_IMG_CF_RGB565:
+    case LV_IMG_CF_RGB888:
+    case LV_IMG_CF_RGBA5658:
+    case LV_IMG_CF_RGBA8888:
+    case LV_IMG_CF_ALPHA_2BIT:
+    case LV_IMG_CF_ALPHA_4BIT:
+    case LV_IMG_CF_ALPHA_8BIT:
+    case LV_IMG_CF_RAW:
+    case LV_IMG_CF_RAW_ALPHA:
+        break;
+    default:
+        goto done;
+    }
+    if (decoded->header.cf != LV_IMG_CF_RAW && decoded->header.cf != LV_IMG_CF_RAW_ALPHA &&
+            decoded->img_data_size < lv_img_buf_get_img_size(decoded->header.w, decoded->header.h,
+                                                            decoded->header.cf)) goto done;
+
+    /* Tiled images start at the top-left; otherwise center them. */
+    int32_t left = coords->x1;
+    int32_t top = coords->y1;
+    if (!dsc->bg_img_tiled)
+    {
+        left += lv_area_get_width(coords) / 2 - decoded->header.w / 2;
+        top += lv_area_get_height(coords) / 2 - decoded->header.h / 2;
+    }
+    if (left < LV_COORD_MIN || top < LV_COORD_MIN ||
+            left + decoded->header.w - 1 > LV_COORD_MAX ||
+            top + decoded->header.h - 1 > LV_COORD_MAX) goto done;
+    lv_area_t area = {left, top, left + decoded->header.w - 1, top + decoded->header.h - 1};
+    lv_area_t image_clip;
+    if (!dsc->bg_img_tiled && !_lv_area_intersect(&image_clip, &clip, &area)) goto done;
+    image = app_cache_alloc(sizeof(*image), IMAGE_CACHE_PSRAM);
+    if (!image) goto done;
+    lv_img_dsc_t source = {0};
+    source.header = decoded->header;
+    source.data = decoded->img_data;
+    source.data_size = decoded->img_data_size;
+    lv_point_t pivot = {0, 0};
+    HAL_EPIC_LayerConfigInit(&image->layer);
+    image->tiled = dsc->bg_img_tiled;
+    setup_fg_layer(&image->layer, &source, &area, 0, EPIC_INPUT_SCALE_NONE, EPIC_INPUT_SCALE_NONE,
+                   &pivot, dsc->bg_img_opa, dsc->bg_img_recolor, 0, 0);
+done:
+    my_draw_cleanup(cache);
+    if (!image) LV_LOG_WARN("Background image unavailable or unsupported");
+    return image;
+}
+
+static void draw_bg(lv_draw_ctx_t *draw_ctx, const lv_draw_rect_dsc_t *dsc, const lv_area_t *coords)
+{
+    lv_color32_t ax_color_u32;
+    drv_epic_rect_image_t *image = bg_image_prepare(draw_ctx, dsc, coords);
+
+    /*Draw bg*/
+    if (dsc->bg_opa >= LV_OPA_MIN || image)
+    {
+        drv_epic_render_buf dst_buf;
+        setup_render_buf(&dst_buf, draw_ctx);
+
+        lv_area_t bg_coords;
+        lv_area_copy(&bg_coords, coords);
+
+        letter_blend_reset();
+        p_line_op = NULL;
+        drv_epic_operation *o = drv_epic_alloc_op(&dst_buf);
+        RT_ASSERT(o != NULL);
+        o->op = DRV_EPIC_DRAW_RECT;
+        o->desc.rectangle.bg_image = image;
+
+        lv_draw_mask_map_param_t mask_param;
+        HAL_EPIC_LayerConfigInit(&o->mask);
+        /* With a background image, the parent mask is attached by the common
+         * commit path (snapshot_parent_mask); only the image-less path keeps
+         * the LVGL map mask here. */
+        if (!image && lv_draw_mask_is_only_map_mask(&bg_coords, &mask_param))
+        {
+            LV_ASSERT(LV_DRAW_MASK_TYPE_MAP == mask_param.dsc.type);
+            setup_mask_layer(&o->mask, LV_IMG_CF_ALPHA_8BIT, mask_param.cfg.map, &mask_param.cfg.coords);
+        }
+
+        LV_AREA_TO_EPIC_AREA(&o->clip_area, draw_ctx->clip_area);
+        LV_AREA_TO_EPIC_AREA(&o->desc.rectangle.area, coords);
+        o->desc.rectangle.radius = dsc->radius;
+
+        ax_color_u32.full = lv_color_to32(dsc->bg_color);
+        ax_color_u32.ch.alpha = dsc->bg_opa;
+        o->desc.rectangle.argb8888 = ax_color_u32.full;
+
+        ax_color_u32.full = lv_color_to32(dsc->bg_grad.stops[0].color);
+        ax_color_u32.ch.alpha = dsc->bg_opa;
+        o->desc.rectangle.grad_color_en = 0;
+        if (LV_GRAD_DIR_VER == dsc->bg_grad.dir)
+        {
+            o->desc.rectangle.grad_color_en = 1;
+            o->desc.rectangle.grad_color.tl = ax_color_u32.full;
+            o->desc.rectangle.grad_color.tr = ax_color_u32.full;
+        }
+        else if (LV_GRAD_DIR_HOR == dsc->bg_grad.dir)
+        {
+            o->desc.rectangle.grad_color_en = 1;
+            o->desc.rectangle.grad_color.tl = ax_color_u32.full;
+            o->desc.rectangle.grad_color.br = ax_color_u32.full;
+        }
+
+        ax_color_u32.full = lv_color_to32(dsc->bg_grad.stops[1].color);
+        ax_color_u32.ch.alpha = dsc->bg_opa;
+
+        if (LV_GRAD_DIR_VER == dsc->bg_grad.dir)
+        {
+            o->desc.rectangle.grad_color.bl = ax_color_u32.full;
+            o->desc.rectangle.grad_color.br = ax_color_u32.full;
+        }
+        else if (LV_GRAD_DIR_HOR == dsc->bg_grad.dir)
+        {
+            o->desc.rectangle.grad_color.tr = ax_color_u32.full;
+            o->desc.rectangle.grad_color.br = ax_color_u32.full;
+        }
+        lv_gpu_render_commit_op(o);
+    }
+}
+
+static void draw_border(lv_draw_ctx_t *draw_ctx,
+                        const lv_draw_rect_dsc_t *dsc, const lv_area_t *coords)
+{
+    if (dsc->border_opa <= LV_OPA_MIN) return;
+    if (dsc->border_width == 0) return;
+    if (dsc->border_side == LV_BORDER_SIDE_NONE) return;
+    if (dsc->border_post) return;
+
+    drv_epic_render_buf dst_buf;
+    setup_render_buf(&dst_buf, draw_ctx);
+
+    letter_blend_reset();
+    p_line_op = NULL;
+    drv_epic_operation *o = drv_epic_alloc_op(&dst_buf);
+    RT_ASSERT(o != NULL);
+    o->op = DRV_EPIC_DRAW_BORDER;
+
+    lv_draw_mask_map_param_t mask_param;
+    HAL_EPIC_LayerConfigInit(&o->mask);
+    if (lv_draw_mask_is_only_map_mask(coords, &mask_param))
+    {
+        LV_ASSERT(LV_DRAW_MASK_TYPE_MAP == mask_param.dsc.type);
+        setup_mask_layer(&o->mask, LV_IMG_CF_ALPHA_8BIT, mask_param.cfg.map, &mask_param.cfg.coords);
+    }
+
+    LV_AREA_TO_EPIC_AREA(&o->clip_area, draw_ctx->clip_area);
+    LV_AREA_TO_EPIC_AREA(&o->desc.border.area, coords);
+    o->desc.border.radius = dsc->radius;
+    o->desc.border.width  = dsc->border_width;
+    o->desc.border.top_side = (dsc->border_side & LV_BORDER_SIDE_TOP) ? 1 : 0;
+    o->desc.border.bot_side = (dsc->border_side & LV_BORDER_SIDE_BOTTOM) ? 1 : 0;
+    o->desc.border.left_side = (dsc->border_side & LV_BORDER_SIDE_LEFT) ? 1 : 0;
+    o->desc.border.right_side = (dsc->border_side & LV_BORDER_SIDE_RIGHT) ? 1 : 0;
+
+    lv_color32_t ax_color_u32;
+    ax_color_u32.full = lv_color_to32(dsc->border_color);
+    ax_color_u32.ch.alpha = dsc->border_opa;
+    o->desc.border.argb8888 = ax_color_u32.full;
+    lv_gpu_render_commit_op(o);
+}
+
+/* Snapshot only the active parent masks. Effect geometry is rendered by EPIC's
+ * driver after submission, so LVGL mask stack pointers must not escape here.
+ *
+ * When a shared cache entry is used, *cache_ref is set to it and the caller
+ * must reference it through op->parent_mask_ref; otherwise it stays NULL and
+ * the caller owns a mask layer with its own coverage (op->mask.data). */
+static bool rect_effect_parent_mask(lv_draw_ctx_t *draw_ctx, const lv_area_t *bounds,
+                                    EPIC_LayerConfigTypeDef *mask, lv_area_t *clip,
+                                    parent_mask_cache_t **cache_ref)
+{
+    HAL_EPIC_LayerConfigInit(mask);
+    if (cache_ref) *cache_ref = NULL;
+    if (!_lv_area_intersect(clip, bounds, draw_ctx->clip_area) ||
+            !_lv_area_intersect(clip, clip, draw_ctx->buf_area)) return false;
+#if LV_DRAW_COMPLEX
+    /* Trim only the guaranteed transparent exterior of inner radius masks. */
+    for (uint32_t i = 0; i < _LV_MASK_MAX_NUM; i++)
+    {
+        const _lv_draw_mask_common_dsc_t *param = LV_GC_ROOT(_lv_draw_mask_list[i]).param;
+        if (!param || param->type != LV_DRAW_MASK_TYPE_RADIUS) continue;
+        const lv_draw_mask_radius_param_t *radius = (const lv_draw_mask_radius_param_t *)param;
+        if (!radius->cfg.outer && !_lv_area_intersect(clip, clip, &radius->cfg.rect)) return false;
+    }
+    if (!parent_mask_needs_snapshot(clip)) return true;
+
+    /* Try the shared cache first. Only a pure inner-radius mask stack yields
+     * a cacheable key; anything else falls through to a per-op snapshot. */
+    parent_mask_key_t key = {0};
+    parent_mask_cache_status_t cache_status = parent_mask_cache_make_key(draw_ctx, &key);
+    if (cache_status == PARENT_MASK_CACHE_EMPTY) return false;  /* Fully clipped: invalidate the op */
+    if (cache_status == PARENT_MASK_CACHE_READY && cache_ref &&
+            _lv_area_intersect(clip, clip, &key.area))          /* Keep the clip inside the cached area */
+    {
+        parent_mask_cache_t *cache = parent_mask_cache_get(&key);
+        if (cache)
+        {
+            /* Attach the shared coverage; ownership is tracked via *cache_ref. */
+            setup_mask_layer(mask, LV_IMG_CF_ALPHA_8BIT, cache->coverage, &cache->key.area);
+            *cache_ref = cache;
+            return true;
+        }
+    }
+
+    /* Fallback: allocate a per-operation snapshot (original path). */
+    int32_t width = lv_area_get_width(clip);
+    size_t size = (size_t)width * lv_area_get_height(clip);
+    uint8_t *coverage = app_cache_alloc(size, IMAGE_CACHE_PSRAM);
+    if (!coverage)
+    {
+        LOG_E("EPIC parent mask allocation failed: %u bytes", (unsigned)size);
+        return false;
+    }
+    memset(coverage, 255, size);
+    for (int32_t y = clip->y1; y <= clip->y2; y++)
+    {
+        uint8_t *line = coverage + (y - clip->y1) * width;
+        if (lv_draw_mask_apply(line, clip->x1, y, width) == LV_DRAW_MASK_RES_TRANSP)
+            memset(line, 0, width);
+    }
+    setup_mask_layer(mask, LV_IMG_CF_ALPHA_8BIT, coverage, clip);
+#endif
+    return true;
+}
+
+/* Capture LVGL masks before their stack entries disappear. Existing operation
+ * masks retain their own ownership; combining them with parent masks is deferred. */
+static void snapshot_parent_mask(drv_epic_operation *op)
+{
+#if LV_DRAW_COMPLEX
+    if (op->mask.data)
+    {
+        /* TODO: Combine existing operation coverage with the active parent masks. */
+        return;
+    }
+    if (!lv_draw_mask_is_any(NULL))
+    {
+        return;
+    }
+
+    lv_draw_ctx_t *ctx = _lv_refr_get_disp_refreshing()->driver->draw_ctx;
+    lv_area_t bounds = {op->clip_area.x0, op->clip_area.y0,
+                        op->clip_area.x1, op->clip_area.y1};
+    lv_area_t clip;
+    parent_mask_cache_t *cache = NULL;
+    if (!rect_effect_parent_mask(ctx, &bounds, &op->mask, &clip, &cache))
+    {
+        /* Keep the allocated operation in its list, but never render unclipped
+         * on allocation failure (or an empty intersection). */
+        op->clip_area.x0 = 1;
+        op->clip_area.x1 = 0;
+        return;
+    }
+    if (cache)
+    {
+        /* Shared cache entry: the op references it and releases it on UNLOCK. */
+        op->parent_mask_ref = cache;
+        op->parent_mask_owned = 1;
+    }
+    else
+    {
+        /* Independent snapshot: owned and freed by this operation. */
+        op->parent_mask_owned = op->mask.data != NULL;
+    }
+    LV_AREA_TO_EPIC_AREA(&op->clip_area, &clip);
+#else
+    LV_UNUSED(op);
+#endif
+}
+
+static void draw_outline(lv_draw_ctx_t *draw_ctx, const lv_draw_rect_dsc_t *dsc, const lv_area_t *coords)
+{
+    if (dsc->outline_width <= 0 || dsc->outline_opa <= LV_OPA_MIN) return;
+
+    if (dsc->blend_mode != LV_BLEND_MODE_NORMAL)
+    {
+        LV_LOG_WARN("Outline blend mode unsupported");
+        return;
+    }
+
+    /* Match lv_draw_sw_rect.c's one-pixel overlap at outline_pad == 0. */
+    int32_t pad = (int32_t)dsc->outline_pad - 1;
+    int32_t extent = pad + dsc->outline_width;
+
+    if ((int32_t)lv_area_get_width(coords) + 2 * pad <= 0 ||
+            (int32_t)lv_area_get_height(coords) + 2 * pad <= 0 ||
+            (int32_t)coords->x1 - extent < LV_COORD_MIN ||
+            (int32_t)coords->y1 - extent < LV_COORD_MIN ||
+            (int32_t)coords->x2 + extent > LV_COORD_MAX ||
+            (int32_t)coords->y2 + extent > LV_COORD_MAX) return;
+    lv_area_t bounds = {coords->x1 - extent, coords->y1 - extent,
+                       coords->x2 + extent, coords->y2 + extent};
+    EPIC_LayerConfigTypeDef mask;
+    lv_area_t clip;
+    parent_mask_cache_t *mask_ref = NULL;
+    if (!rect_effect_parent_mask(draw_ctx, &bounds, &mask, &clip, &mask_ref)) return;
+    drv_epic_render_buf dst_buf;
+    setup_render_buf(&dst_buf, draw_ctx);
+    letter_blend_reset();
+    p_line_op = NULL;
+    drv_epic_operation *o = drv_epic_alloc_op(&dst_buf);
+    RT_ASSERT(o != NULL);
+    o->op = DRV_EPIC_DRAW_BORDER;
+    o->mask = mask;
+    if (mask_ref)
+    {
+        /* Shared cache entry: released via trav_cb on UNLOCK. */
+        o->parent_mask_ref = mask_ref;
+        o->parent_mask_owned = 1;
+    }
+    else
+    {
+        /* Independent snapshot owned by the border descriptor. */
+        o->desc.border.mask_owned = mask.data != NULL;
+    }
+    LV_AREA_TO_EPIC_AREA(&o->clip_area, &clip);
+    LV_AREA_TO_EPIC_AREA(&o->desc.border.area, &bounds);
+    int32_t short_side = LV_MIN(lv_area_get_width(coords), lv_area_get_height(coords)) + 2 * pad;
+    o->desc.border.radius = LV_MIN(dsc->radius, short_side / 2) + dsc->outline_width;
+    o->desc.border.width = dsc->outline_width;
+    o->desc.border.top_side = o->desc.border.bot_side = 1;
+    o->desc.border.left_side = o->desc.border.right_side = 1;
+    lv_color32_t argb;
+    argb.full = lv_color_to32(dsc->outline_color);
+    argb.ch.alpha = dsc->outline_opa;
+    o->desc.border.argb8888 = argb.full;
+    lv_gpu_render_commit_op(o);
+}
+
+static void draw_shadow(lv_draw_ctx_t *draw_ctx, const lv_draw_rect_dsc_t *dsc, const lv_area_t *coords)
+{
+#if LV_DRAW_COMPLEX
+    if (dsc->shadow_width <= 0 || dsc->shadow_opa <= LV_OPA_MIN) return;
+
+    if (dsc->shadow_width == 1 && dsc->shadow_spread <= 0 &&
+            dsc->shadow_ofs_x == 0 && dsc->shadow_ofs_y == 0) return;
+
+    if (dsc->blend_mode != LV_BLEND_MODE_NORMAL)
+    {
+        LV_LOG_WARN("Shadow blend mode unsupported");
+        return;
+    }
+    int32_t spread = dsc->shadow_spread;
+    int32_t blur = dsc->shadow_width / 2 + 1;
+    int32_t left = (int32_t)coords->x1 + dsc->shadow_ofs_x - spread - blur;
+    int32_t top = (int32_t)coords->y1 + dsc->shadow_ofs_y - spread - blur;
+    int32_t right = (int32_t)coords->x2 + dsc->shadow_ofs_x + spread + blur;
+    int32_t bottom = (int32_t)coords->y2 + dsc->shadow_ofs_y + spread + blur;
+
+    if ((int32_t)lv_area_get_width(coords) + 2 * spread <= 0 ||
+            (int32_t)lv_area_get_height(coords) + 2 * spread <= 0 ||
+            left < LV_COORD_MIN || top < LV_COORD_MIN ||
+            right > LV_COORD_MAX || bottom > LV_COORD_MAX) return;
+
+    lv_area_t bounds = {left, top, right, bottom};
+    EPIC_LayerConfigTypeDef mask;
+    lv_area_t clip;
+    parent_mask_cache_t *mask_ref = NULL;
+    if (!rect_effect_parent_mask(draw_ctx, &bounds, &mask, &clip, &mask_ref)) return;
+    drv_epic_render_buf dst_buf;
+    setup_render_buf(&dst_buf, draw_ctx);
+    letter_blend_reset();
+    p_line_op = NULL;
+    drv_epic_operation *o = drv_epic_alloc_op(&dst_buf);
+    RT_ASSERT(o != NULL);
+    o->op = DRV_EPIC_DRAW_SHADOW;
+    o->mask = mask;
+    if (mask_ref)
+    {
+        /* Shared cache entry: released via trav_cb on UNLOCK. */
+        o->parent_mask_ref = mask_ref;
+        o->parent_mask_owned = 1;
+    }
+    else
+    {
+        /* Independent snapshot owned by the shadow descriptor. */
+        o->desc.shadow.mask_owned = mask.data != NULL;
+    }
+    LV_AREA_TO_EPIC_AREA(&o->clip_area, &clip);
+    LV_AREA_TO_EPIC_AREA(&o->desc.shadow.area, coords);
+    o->desc.shadow.radius = dsc->radius;
+    o->desc.shadow.width = dsc->shadow_width;
+    o->desc.shadow.spread = dsc->shadow_spread;
+    o->desc.shadow.ofs_x = dsc->shadow_ofs_x;
+    o->desc.shadow.ofs_y = dsc->shadow_ofs_y;
+    lv_color32_t argb;
+    argb.full = lv_color_to32(dsc->shadow_color);
+    argb.ch.alpha = dsc->shadow_opa;
+    o->desc.shadow.argb8888 = argb.full;
+    lv_gpu_render_commit_op(o);
+#else
+    LV_UNUSED(draw_ctx);
+    LV_UNUSED(dsc);
+    LV_UNUSED(coords);
+#endif
+}
+
+static void draw_rect(struct _lv_draw_ctx_t *draw_ctx, const lv_draw_rect_dsc_t *dsc, const lv_area_t *coords)
+{
+    draw_shadow(draw_ctx, dsc, coords);
+
+    /*Draw bg*/
+    if (dsc->bg_opa >= LV_OPA_MIN || (dsc->bg_img_src && dsc->bg_img_opa > LV_OPA_MIN))
+        draw_bg(draw_ctx, dsc, coords);
+
+    /*Draw border*/
+    draw_border(draw_ctx, dsc, coords);
+
+    draw_outline(draw_ctx, dsc, coords);
+}
+
+
+/**
+ * Prepare the image source layer for an image arc operation.
+ *
+ * Decodes the image from dsc->img_src via the LVGL image cache, validates
+ * the color format, centers the image on the arc center, and configures the
+ * foreground image layer. Parent coverage is attached by the common operation
+ * commit path so image arcs share it with other operations.
+ *
+ * @param draw_ctx  Pointer to the LVGL draw context
+ * @param dsc       Pointer to the arc draw descriptor containing img_src
+ * @param center    Pointer to the arc center point
+ * @return          Pointer to the configured EPIC image layer, or NULL on failure
+ */
+static EPIC_LayerConfigTypeDef *arc_image_prepare(lv_draw_ctx_t *draw_ctx,
+        const lv_draw_arc_dsc_t *dsc, const lv_point_t *center)
+{
+    if (dsc->blend_mode != LV_BLEND_MODE_NORMAL ||
+            lv_img_src_get_type(dsc->img_src) == LV_IMG_SRC_SYMBOL) return NULL;
+    _lv_img_cache_entry_t *cache = _lv_img_cache_open(dsc->img_src, lv_color_black(), 0);
+    if (!cache) return NULL;
+    lv_img_decoder_dsc_t *decoded = &cache->dec_dsc;
+    EPIC_LayerConfigTypeDef *image = NULL;
+    if (decoded->error_msg || !decoded->img_data || !decoded->img_data_size ||
+            !decoded->header.w || !decoded->header.h) goto done;
+    switch (decoded->header.cf)
+    {
+    case LV_IMG_CF_TRUE_COLOR:
+    case LV_IMG_CF_TRUE_COLOR_ALPHA:
+    case LV_IMG_CF_RAW:
+    case LV_IMG_CF_RAW_ALPHA:
+    case LV_IMG_CF_RGB565:
+    case LV_IMG_CF_RGB888:
+    case LV_IMG_CF_RGBA5658:
+    case LV_IMG_CF_RGBA8888:
+        break;
+    default:
+        goto done;
+    }
+    int32_t left = (int32_t)center->x - (int32_t)decoded->header.w / 2;
+    int32_t top = (int32_t)center->y - (int32_t)decoded->header.h / 2;
+    if (left < LV_COORD_MIN || top < LV_COORD_MIN ||
+            left + decoded->header.w - 1 > LV_COORD_MAX ||
+            top + decoded->header.h - 1 > LV_COORD_MAX) goto done;
+    lv_area_t area = {left, top, 0, 0};
+    area.x2 = area.x1 + decoded->header.w - 1;
+    area.y2 = area.y1 + decoded->header.h - 1;
+    lv_area_t mask_area;
+    if (!_lv_area_intersect(&mask_area, &area, draw_ctx->clip_area) ||
+            !_lv_area_intersect(&mask_area, &mask_area, draw_ctx->buf_area)) goto done;
+    size_t source_size = decoded->img_data_size;
+    if (!EPIC_SUPPORTED_CF(decoded->header.cf)) goto done;
+    if (decoded->header.cf != LV_IMG_CF_RAW && decoded->header.cf != LV_IMG_CF_RAW_ALPHA &&
+            source_size < lv_img_buf_get_img_size(decoded->header.w, decoded->header.h, decoded->header.cf))
+        goto done;
+    image = app_malloc(sizeof(*image));
+    if (!image) goto done;
+    lv_img_dsc_t source = {0};
+    source.header = decoded->header;
+    source.data = decoded->img_data;
+    source.data_size = source_size;
+    lv_point_t pivot = {0, 0};
+    HAL_EPIC_LayerConfigInit(image);
+    setup_fg_layer(image, &source, &area, 0, EPIC_INPUT_SCALE_NONE, EPIC_INPUT_SCALE_NONE,
+                   &pivot, dsc->opa, dsc->color, 0, 0);
+done:
+    my_draw_cleanup(cache);
+    return image;
+}
+
+static void draw_arc(struct _lv_draw_ctx_t *draw_ctx, const lv_draw_arc_dsc_t *dsc, const lv_point_t *center,
+                     uint16_t radius,  uint16_t start_angle, uint16_t end_angle)
+
+{
+    EPIC_LayerConfigTypeDef *image = NULL;
+    EPIC_LayerConfigTypeDef parent;
+    HAL_EPIC_LayerConfigInit(&parent);
+    if (dsc->img_src)
+    {
+        if (dsc->opa <= LV_OPA_MIN || !dsc->width || !radius || start_angle == end_angle) return;
+        if ((int32_t)center->x - radius < LV_COORD_MIN || (int32_t)center->y - radius < LV_COORD_MIN ||
+                (int32_t)center->x + radius - 1 > LV_COORD_MAX || (int32_t)center->y + radius - 1 > LV_COORD_MAX)
+        {
+            LV_LOG_WARN("arc image coordinates out of range");
+            return;
+        }
+        image = arc_image_prepare(draw_ctx, dsc, center);
+        if (!image)
+        {
+            LV_LOG_WARN("arc image unavailable or unsupported");
+            return;
+        }
+    }
+    drv_epic_render_buf dst_buf;
+    setup_render_buf(&dst_buf, draw_ctx);
+
+    letter_blend_reset();
+    p_line_op = NULL;
+    drv_epic_operation *o = drv_epic_alloc_op(&dst_buf);
+    RT_ASSERT(o != NULL);
+
+    o->op = DRV_EPIC_DRAW_ARC;
+    o->desc.arc.image = image;
+    o->mask = parent;
+    LV_AREA_TO_EPIC_AREA(&o->clip_area, draw_ctx->clip_area);
+
+    o->desc.arc.center_x = center->x;
+    o->desc.arc.center_y = center->y;
+    o->desc.arc.start_angle = start_angle;
+    o->desc.arc.end_angle = end_angle;
+    o->desc.arc.radius = radius;
+
+    lv_color32_t ax_color_u32;
+    ax_color_u32.full = lv_color_to32(dsc->color);
+    ax_color_u32.ch.alpha = dsc->opa;
+    o->desc.arc.argb8888 = ax_color_u32.full;
+
+    o->desc.arc.width = dsc->width;
+    o->desc.arc.round_start = dsc->rounded;
+    o->desc.arc.round_end = dsc->rounded;
+
+    lv_gpu_render_commit_op(o);
+}
+
+
+
+static void draw_line(struct _lv_draw_ctx_t *draw_ctx, const lv_draw_line_dsc_t *dsc, const lv_point_t *point1,
+                      const lv_point_t *point2)
+{
+    letter_blend_reset();
+
+    lv_color32_t ax_color_u32;
+    ax_color_u32.full = lv_color_to32(dsc->color);
+    ax_color_u32.ch.alpha = dsc->opa;
+
+    if (p_line_op \
+            && line_target == draw_ctx->buf \
+            && !lv_draw_mask_is_any(NULL) && !p_line_op->mask.data \
+            && p_line_op->clip_area.x0 == draw_ctx->clip_area->x1 \
+            && p_line_op->clip_area.y0 == draw_ctx->clip_area->y1 \
+            && p_line_op->clip_area.x1 == draw_ctx->clip_area->x2 \
+            && p_line_op->clip_area.y1 == draw_ctx->clip_area->y2 \
+            && p_line_op->desc.line.argb8888 == ax_color_u32.full \
+            && p_line_op->desc.line.width == dsc->width \
+            && p_line_op->desc.line.dash_width == dsc->dash_width \
+            && p_line_op->desc.line.dash_gap == dsc->dash_gap \
+            && p_line_op->desc.line.round_start == dsc->round_start \
+            && p_line_op->desc.line.round_end == dsc->round_end \
+            && p_line_op->desc.line.raw_end == dsc->raw_end \
+            && p_line_op->desc.line.point_cnt + 2 < LINE_POINTS_CNT_MAX)
+    {
+        if (!p_line_op->desc.line.p_points)
+        {
+            void *p_buf = app_calloc(1, LINE_POINTS_CNT_MAX * sizeof(EPIC_PointTypeDef));
+            RT_ASSERT(p_buf);
+            p_line_op->desc.line.p_points = p_buf;
+            p_line_op->desc.line.point_cnt = 0;
+        }
+
+        int32_t index = p_line_op->desc.line.point_cnt;
+        EPIC_PointTypeDef *p_point = &p_line_op->desc.line.p_points[index];
+        LV_AREA_INSERT_EPIC_AREA(&p_line_op->clip_area, draw_ctx->clip_area);
+
+        p_point->x = point1->x;
+        p_point->y = point1->y;
+        p_point++;
+        p_point->x = point2->x;
+        p_point->y = point2->y;
+        p_line_op->desc.line.point_cnt += 2;
+
+        /*Merge process, return directly*/
+        return ;
+    }
+
+
+    {
+        drv_epic_render_buf dst_buf;
+        setup_render_buf(&dst_buf, draw_ctx);
+        drv_epic_operation *o = drv_epic_alloc_op(&dst_buf);
+        RT_ASSERT(o != NULL);
+
+        o->op = DRV_EPIC_DRAW_LINE;
+        LV_AREA_TO_EPIC_AREA(&o->clip_area, draw_ctx->clip_area);
+
+        o->desc.line.argb8888 = ax_color_u32.full;
+        o->desc.line.width = dsc->width;
+        o->desc.line.dash_width = dsc->dash_width;
+        o->desc.line.dash_gap = dsc->dash_gap;
+        o->desc.line.round_start = dsc->round_start;
+        o->desc.line.round_end = dsc->round_end;
+        o->desc.line.raw_end = dsc->raw_end;
+        o->desc.line.p1.x = point1->x;
+        o->desc.line.p1.y = point1->y;
+        o->desc.line.p2.x = point2->x;
+        o->desc.line.p2.y = point2->y;
+        o->desc.line.point_cnt = 0;
+        o->desc.line.p_points = NULL;
+
+        lv_gpu_render_commit_op(o);
+        p_line_op = o;
+        line_target = draw_ctx->buf;
+    }
+}
+
+
+static void draw_polygon(struct _lv_draw_ctx_t *draw_ctx, const lv_draw_rect_dsc_t *draw_dsc,
+                         const lv_point_t *points, uint16_t point_cnt)
+{
+    if (points == NULL || DRV_EPIC_POLYGON_POINT_MAX < point_cnt) return;
+
+    /*Join adjacent points if they are on the same coordinate*/
+    lv_point_t p[DRV_EPIC_POLYGON_POINT_MAX];
+    uint16_t i;
+    uint16_t pcnt = 0;
+    p[0] = points[0];
+    for (i = 0; i < point_cnt - 1; i++)
+    {
+        if (points[i].x != points[i + 1].x || points[i].y != points[i + 1].y)
+        {
+            p[pcnt] = points[i];
+            pcnt++;
+        }
+    }
+    /*The first and the last points are also adjacent*/
+    if (points[0].x != points[point_cnt - 1].x || points[0].y != points[point_cnt - 1].y)
+    {
+        p[pcnt] = points[point_cnt - 1];
+        pcnt++;
+    }
+
+    point_cnt = pcnt;
+    if (point_cnt < 3) return;
+
+    lv_area_t poly_coords = {.x1 = LV_COORD_MAX, .y1 = LV_COORD_MAX, .x2 = LV_COORD_MIN, .y2 = LV_COORD_MIN};
+
+    for (i = 0; i < point_cnt; i++)
+    {
+        poly_coords.x1 = LV_MIN(poly_coords.x1, p[i].x);
+        poly_coords.y1 = LV_MIN(poly_coords.y1, p[i].y);
+        poly_coords.x2 = LV_MAX(poly_coords.x2, p[i].x);
+        poly_coords.y2 = LV_MAX(poly_coords.y2, p[i].y);
+    }
+
+    lv_area_t clip_area;
+    if (!_lv_area_intersect(&clip_area, &poly_coords, draw_ctx->clip_area))
+        return;
+
+    drv_epic_render_buf dst_buf;
+    setup_render_buf(&dst_buf, draw_ctx);
+    letter_blend_reset();
+    p_line_op = NULL;
+    drv_epic_operation *o = drv_epic_alloc_op(&dst_buf);
+    RT_ASSERT(o != NULL);
+
+    o->op = DRV_EPIC_DRAW_POLYGON;
+    LV_AREA_TO_EPIC_AREA(&o->clip_area, &clip_area);
+
+    lv_color32_t ax_color_u32;
+    ax_color_u32.full = lv_color_to32(draw_dsc->bg_color);
+    ax_color_u32.ch.alpha = draw_dsc->bg_opa;
+    o->desc.polygon.argb8888 = ax_color_u32.full;
+    o->desc.polygon.point_cnt = point_cnt;
+    for (uint16_t i = 0; i < point_cnt; i++)
+    {
+        o->desc.polygon.points[i].x = points[i].x;
+        o->desc.polygon.points[i].y = points[i].y;
+    }
+    lv_gpu_render_commit_op(o);
+
+}
+
+
+void my_gpu_wait(lv_draw_ctx_t *draw_ctx)
+{
+
+    letter_blend_reset();
+    p_line_op = NULL;
+    // check_gpu_done2();
+
+    // /*Call SW renderer's wait callback too*/
+    // lv_draw_sw_wait_for_finish(draw_ctx);
+}
+
+static void epic_layer_done(drv_epic_render_list_t list, EPIC_LayerConfigTypeDef *dst,
+                            void *usr_data, uint32_t last)
+{
+    LV_UNUSED(dst);
+    LV_UNUSED(last);
+    lv_gpu_render_mem_unlock(list);
+    rt_sem_release((rt_sem_t)usr_data);
+}
+
+static void epic_layer_finish(lv_draw_ctx_t *draw_ctx, epic_layer_ctx_t *layer)
+{
+    if (!layer->list) return;
+    my_gpu_wait(draw_ctx);
+    struct rt_semaphore sem;
+    EPIC_MsgTypeDef msg = {0};
+    rt_sem_init(&sem, "lv_layer", 0, RT_IPC_FLAG_FIFO);
+    msg.id = EPIC_MSG_RENDER_TO_BUF;
+    msg.render_list = layer->list;
+    lv_area_to_EPIC_area(&layer->base.area_act, &msg.content.r2b.dst_area);
+    msg.content.r2b.done_cb = epic_layer_done;
+    msg.content.r2b.usr_data = &sem;
+    drv_epic_render_msg_commit(&msg);
+    rt_err_t err = rt_sem_take(&sem, RT_WAITING_FOREVER);
+    RT_ASSERT(RT_EOK == err);
+    rt_sem_detach(&sem);
+    layer->list = NULL;
+}
+
+static void epic_layer_begin(lv_draw_ctx_t *draw_ctx, epic_layer_ctx_t *layer)
+{
+    drv_epic_render_buf buf;
+    setup_render_buf(&buf, draw_ctx);
+    layer->list = drv_epic_alloc_render_list(&buf, NULL);
+    RT_ASSERT(layer->list);
+}
+
+static void epic_layer_adjust(lv_draw_ctx_t *draw_ctx, lv_draw_layer_ctx_t *base,
+                              lv_draw_layer_flags_t flags)
+{
+    epic_layer_ctx_t *layer = (epic_layer_ctx_t *)base;
+    epic_draw_ctx_t *ctx = (epic_draw_ctx_t *)draw_ctx;
+    bool alpha = (flags & LV_DRAW_LAYER_FLAG_HAS_ALPHA) != 0;
+    my_gpu_wait(draw_ctx);
+    layer->cf = alpha ? (LV_COLOR_DEPTH == 16 ? LV_IMG_CF_RGBA5658 : LV_IMG_CF_RGBA8888)
+                     : LV_IMG_CF_TRUE_COLOR;
+    /* Each chunk has its own pixels: the parent list may consume it much later. */
+    if (!base->buf) base->buf = app_cache_alloc(layer->buf_size, IMAGE_CACHE_PSRAM);
+    RT_ASSERT(base->buf);
+    memset(base->buf, 0, layer->buf_size);
+    ctx->epic_layer = base;
+    draw_ctx->buf = base->buf;
+    draw_ctx->buf_area = &base->area_act;
+    draw_ctx->clip_area = &base->area_act;
+    _lv_refr_get_disp_refreshing()->driver->screen_transp = alpha;
+    epic_layer_begin(draw_ctx, layer);
+}
+
+static lv_draw_layer_ctx_t *epic_layer_init(lv_draw_ctx_t *draw_ctx, lv_draw_layer_ctx_t *base,
+                                           lv_draw_layer_flags_t flags)
+{
+    epic_layer_ctx_t *layer = (epic_layer_ctx_t *)base;
+    epic_draw_ctx_t *ctx = (epic_draw_ctx_t *)draw_ctx;
+    uint32_t width = lv_area_get_width(&base->area_full);
+    uint32_t height = lv_area_get_height(&base->area_full);
+    uint32_t px_size = LV_COLOR_DEPTH == 16 ? 3 : 4;
+    if (LV_COLOR_DEPTH != 16 && LV_COLOR_DEPTH != 24 && LV_COLOR_DEPTH != 32)
+    {
+        LV_LOG_WARN("EPIC layers require 16, 24 or 32 bit color");
+        return NULL;
+    }
+    if (!width || !height || width > UINT32_MAX / px_size / height) return NULL;
+    base->area_act = base->area_full;
+    uint32_t rows = height;
+    if (flags & LV_DRAW_LAYER_FLAG_CAN_SUBDIVIDE)
+    {
+        rows = LV_LAYER_SIMPLE_BUF_SIZE / (width * px_size);
+        if (!rows) rows = 1;
+        if (rows > height) rows = height;
+    }
+    layer->buf_size = width * rows * px_size;
+    base->buf = app_cache_alloc(layer->buf_size, IMAGE_CACHE_PSRAM);
+    if (!base->buf)
+    {
+        LV_LOG_WARN("Cannot allocate EPIC layer pixels");
+        return NULL;
+    }
+    my_gpu_wait(draw_ctx);
+    layer->parent = ctx->epic_layer;
+    /* Keep the existing two-list pool usable at arbitrary object nesting depth. */
+    if (layer->parent) epic_layer_finish(draw_ctx, (epic_layer_ctx_t *)layer->parent);
+    base->max_row_with_alpha = rows;
+    base->max_row_with_no_alpha = rows;
+    if (!(flags & LV_DRAW_LAYER_FLAG_CAN_SUBDIVIDE)) epic_layer_adjust(draw_ctx, base, flags);
+    return base;
+}
+
+static void epic_layer_blend(lv_draw_ctx_t *draw_ctx, lv_draw_layer_ctx_t *base,
+                             const lv_draw_img_dsc_t *dsc)
+{
+    epic_layer_ctx_t *layer = (epic_layer_ctx_t *)base;
+    epic_draw_ctx_t *ctx = (epic_draw_ctx_t *)draw_ctx;
+    epic_layer_finish(draw_ctx, layer);
+    draw_ctx->buf = base->original.buf;
+    draw_ctx->buf_area = base->original.buf_area;
+    draw_ctx->clip_area = base->original.clip_area;
+    _lv_refr_get_disp_refreshing()->driver->screen_transp = base->original.screen_transp;
+    ctx->epic_layer = layer->parent;
+    if (layer->parent && !((epic_layer_ctx_t *)layer->parent)->list)
+        epic_layer_begin(draw_ctx, (epic_layer_ctx_t *)layer->parent);
+
+    lv_area_t clip;
+    lv_area_t bounds;
+    EPIC_LayerConfigTypeDef mask;
+    parent_mask_cache_t *mask_ref = NULL;
+    _lv_img_buf_get_transformed_area(&bounds, lv_area_get_width(&base->area_act),
+                                    lv_area_get_height(&base->area_act), dsc->angle,
+                                    dsc->zoom, &dsc->pivot);
+    lv_area_move(&bounds, base->area_act.x1, base->area_act.y1);
+    if (!dsc->zoom || dsc->opa < LV_OPA_MIN ||
+            !rect_effect_parent_mask(draw_ctx, &bounds, &mask, &clip, &mask_ref))
+    {
+        app_cache_free(base->buf);
+        base->buf = NULL;
+        return;
+    }
+    drv_epic_render_buf dst;
+    setup_render_buf(&dst, draw_ctx);
+    drv_epic_operation *op = drv_epic_alloc_op(&dst);
+    RT_ASSERT(op);
+    op->op = DRV_EPIC_DRAW_IMAGE;
+    op->mask = mask;
+    if (mask_ref)
+    {
+        /* Shared cache entry: released via trav_cb on UNLOCK. */
+        op->parent_mask_ref = mask_ref;
+        op->parent_mask_owned = 1;
+    }
+    LV_AREA_TO_EPIC_AREA(&op->clip_area, &clip);
+    lv_img_dsc_t image = {0};
+    image.data = base->buf;
+    image.header.cf = layer->cf;
+    image.header.w = lv_area_get_width(&base->area_act);
+    image.header.h = lv_area_get_height(&base->area_act);
+    image.data_size = (uint32_t)image.header.w * image.header.h *
+                     (HAL_EPIC_GetColorDepth(lv_img_2_epic_cf2(layer->cf)) >> 3);
+    lv_point_t pivot = dsc->pivot;
+    int32_t pitch = (uint32_t)LV_IMG_ZOOM_NONE * EPIC_INPUT_SCALE_NONE / dsc->zoom;
+    HAL_EPIC_LayerConfigInit(&op->desc.blend.layer);
+    setup_fg_layer(&op->desc.blend.layer, &image, &base->area_act, dsc->angle,
+                   pitch, pitch, &pivot, dsc->opa, dsc->recolor,
+                   dsc->coord_x_frac, dsc->coord_y_frac);
+    op->desc.blend.use_dest_as_bg = EPIC_BLEND_MODE_NORMAL;
+    op->desc.blend.layer_owned = 1;
+    lv_gpu_render_commit_op(op);
+    base->buf = NULL;
+}
+
+static void epic_layer_destroy(lv_draw_ctx_t *draw_ctx, lv_draw_layer_ctx_t *base)
+{
+    epic_layer_ctx_t *layer = (epic_layer_ctx_t *)base;
+    RT_ASSERT(!layer->list);
+    ((epic_draw_ctx_t *)draw_ctx)->epic_layer = layer->parent;
+    if (base->buf) app_cache_free(base->buf);
+}
+
+static void draw_ctx_setup_gpu(lv_draw_ctx_t *p_draw_ctx, bool en)
+{
+#if LV_USE_GPU
+    epic_draw_ctx_t *my_draw_ctx = (epic_draw_ctx_t *)p_draw_ctx;
+    lv_draw_sw_ctx_t *draw_ctx = &my_draw_ctx->sw_ctx;
+
+    if (draw_ctx->base_draw.wait_for_finish)
+        draw_ctx->base_draw.wait_for_finish(&draw_ctx->base_draw);
+
+    if (en)
+    {
+        my_draw_ctx->sw_ctx.blend = draw_blend;
+        my_draw_ctx->sw_ctx.base_draw.draw_rect = draw_rect;
+        my_draw_ctx->sw_ctx.base_draw.draw_arc = draw_arc;
+        my_draw_ctx->sw_ctx.base_draw.draw_line = draw_line;
+        my_draw_ctx->sw_ctx.base_draw.draw_polygon = draw_polygon;
+        my_draw_ctx->sw_ctx.base_draw.draw_img = my_decode_and_draw;//draw_img;
+        my_draw_ctx->sw_ctx.base_draw.wait_for_finish = my_gpu_wait;
+        my_draw_ctx->sw_ctx.base_draw.draw_letter = draw_letter;
+        my_draw_ctx->sw_ctx.base_draw.draw_bg = draw_bg;
+        p_draw_ctx->layer_init = epic_layer_init;
+        p_draw_ctx->layer_adjust = epic_layer_adjust;
+        p_draw_ctx->layer_blend = epic_layer_blend;
+        p_draw_ctx->layer_destroy = epic_layer_destroy;
+        p_draw_ctx->layer_instance_size = sizeof(epic_layer_ctx_t);
+    }
+    else
+    {
+        my_draw_ctx->sw_ctx.blend = my_draw_ctx->sw_ctx_backup.blend;
+        my_draw_ctx->sw_ctx.base_draw.draw_rect = my_draw_ctx->sw_ctx_backup.base_draw.draw_rect;
+        my_draw_ctx->sw_ctx.base_draw.draw_arc = my_draw_ctx->sw_ctx_backup.base_draw.draw_arc;
+        my_draw_ctx->sw_ctx.base_draw.draw_line = my_draw_ctx->sw_ctx_backup.base_draw.draw_line;
+        my_draw_ctx->sw_ctx.base_draw.draw_polygon = my_draw_ctx->sw_ctx_backup.base_draw.draw_polygon;
+        my_draw_ctx->sw_ctx.base_draw.draw_img = my_draw_ctx->sw_ctx_backup.base_draw.draw_img;
+        my_draw_ctx->sw_ctx.base_draw.wait_for_finish = my_draw_ctx->sw_ctx_backup.base_draw.wait_for_finish;
+        my_draw_ctx->sw_ctx.base_draw.draw_letter = my_draw_ctx->sw_ctx_backup.base_draw.draw_letter;
+        my_draw_ctx->sw_ctx.base_draw.draw_bg = my_draw_ctx->sw_ctx_backup.base_draw.draw_bg;
+        p_draw_ctx->layer_init = my_draw_ctx->sw_ctx_backup.base_draw.layer_init;
+        p_draw_ctx->layer_adjust = my_draw_ctx->sw_ctx_backup.base_draw.layer_adjust;
+        p_draw_ctx->layer_blend = my_draw_ctx->sw_ctx_backup.base_draw.layer_blend;
+        p_draw_ctx->layer_destroy = my_draw_ctx->sw_ctx_backup.base_draw.layer_destroy;
+        p_draw_ctx->layer_instance_size = my_draw_ctx->sw_ctx_backup.base_draw.layer_instance_size;
+    }
+#endif
+}
+
+
+uint32_t lv_gpu_render_start(lv_disp_drv_t *disp_drv)
+{
+    uint32_t draw_buf_cf;
+    if (set_px_cb_rgb565 == disp_drv->set_px_cb)
+        draw_buf_cf = LV_IMG_CF_RGB565;
+    else if (set_px_true_color_alpha == disp_drv->set_px_cb)
+        draw_buf_cf = LV_IMG_CF_TRUE_COLOR_ALPHA;
+    else if (NULL == disp_drv->set_px_cb)
+        draw_buf_cf = LV_IMG_CF_TRUE_COLOR;
+    else
+        draw_buf_cf = LV_IMG_CF_UNKNOWN;
+
+    if (LV_IMG_CF_UNKNOWN != draw_buf_cf)
+    {
+        drv_epic_render_buf render_buf;
+        EPIC_AreaTypeDef ow_area;
+        drv_epic_render_list_t p_rd_list;
+
+        render_buf.cf = lv_img_2_epic_cf2(draw_buf_cf);
+        /* Canvas/snapshot displays only populate the draw context. */
+        render_buf.data = disp_drv->draw_ctx->buf;
+        lv_area_to_EPIC_area(disp_drv->draw_ctx->buf_area, &render_buf.area);
+        p_rd_list = drv_epic_alloc_render_list(&render_buf, &ow_area);
+        RT_ASSERT(p_rd_list != NULL);
+
+        RT_ASSERT(!HAL_EPIC_AreaIsValid(&ow_area));
+
+        if (draw_buf_cf == LV_IMG_CF_TRUE_COLOR_ALPHA)
+        {
+            drv_epic_operation *o = drv_epic_alloc_op(&render_buf);
+            RT_ASSERT(o != NULL);
+            o->op = DRV_EPIC_DRAW_FILL;
+            lv_area_to_EPIC_area(disp_drv->draw_ctx->buf_area, &o->clip_area);
+            HAL_EPIC_LayerConfigInit(&o->mask);
+            o->desc.fill.r = 0;
+            o->desc.fill.g = 0;
+            o->desc.fill.b = 0;
+            o->desc.fill.opa = 0;
+            drv_epic_commit_op(o);
+        }
+
+        return (uint32_t)p_rd_list;
+    }
+    else //Unsupported destination format, use software render
+    {
+        draw_ctx_setup_gpu(disp_drv->draw_ctx, false);
+        return 0;
+    }
+}
+/*
+    p_area - the real area of 'rl->dst'
+*/
+static void drv_epic_render_done_cb(drv_epic_render_list_t rl, EPIC_LayerConfigTypeDef *p_dst, void *usr_data, uint32_t last)
+{
+    lv_gpu_render_mem_unlock(rl);
+    if (usr_data)
+    {
+        rt_sem_t sem = (rt_sem_t)usr_data;
+        rt_sem_release(sem);
+    }
+}
+
+void lv_gpu_render_end(lv_disp_drv_t *disp_drv, uint32_t rl, lv_area_t *p_area)
+{
+    if (rl != 0)
+    {
+        struct rt_semaphore sem;
+        EPIC_MsgTypeDef msg;
+        LV_DEBUG_MARK_START(0x200, "sync snapshot");
+        p_line_op = NULL;
+        letter_blend_reset(); //Commit last letter blend if present
+        rt_sem_init(&sem, "snapshot", 0, RT_IPC_FLAG_FIFO);
+
+        msg.id = EPIC_MSG_RENDER_TO_BUF;
+        msg.render_list = (drv_epic_render_list_t) rl;
+        if (!p_area) p_area = disp_drv->draw_ctx->buf_area; //Use buf area if no scaling
+        lv_area_to_EPIC_area(p_area, &msg.content.r2b.dst_area);
+        msg.content.r2b.done_cb = drv_epic_render_done_cb;
+        msg.content.r2b.usr_data = (rt_sem_t)&sem;
+        drv_epic_render_msg_commit(&msg);
+        if (RT_EOK != rt_sem_take(&sem, 6000))
+        {
+            LOG_I("synchronize snapshot error.\n");
+            RT_ASSERT(NULL);
+        }
+        rt_sem_detach(&sem);
+        LV_DEBUG_MARK_STOP(0x200);
+    }
+    else//Restore GPU render
+    {
+        draw_ctx_setup_gpu(disp_drv->draw_ctx, true);
+    }
+}
+
+
+void lv_gpu_epic_ctx_init(lv_disp_drv_t *drv, lv_draw_ctx_t *draw_ctx)
+{
+    /*Initialize the parent type first */
+    lv_draw_sw_init_ctx(drv, draw_ctx);
+
+
+    /*Change some callbacks*/
+    epic_draw_ctx_t *my_draw_ctx = (epic_draw_ctx_t *)draw_ctx;
+
+    my_draw_ctx->epic_layer = NULL;
+    memcpy(&my_draw_ctx->sw_ctx_backup, &my_draw_ctx->sw_ctx, sizeof(lv_draw_sw_ctx_t));
+
+    draw_ctx_setup_gpu(draw_ctx, true);
+}
+
+
+void lv_gpu_epic_ctx_deinit(lv_disp_drv_t *drv, lv_draw_ctx_t *draw_ctx)
+{
+    LV_UNUSED(drv);
+    LV_UNUSED(draw_ctx);
+}
+
+
+#endif /* LV_USE_GPU */
+
+
+void lv_gpu_init(lv_disp_drv_t *drv)
+{
+    /*New draw ctx settings*/
+    drv->draw_ctx_init   = lv_gpu_epic_ctx_init;
+    drv->draw_ctx_deinit = lv_gpu_epic_ctx_deinit;
+    drv->draw_ctx_size   = sizeof(epic_draw_ctx_t);
+    /*
+    #elif LV_USE_GPU_ARM2D
+        driver->draw_ctx_init = lv_draw_arm2d_ctx_init;
+        driver->draw_ctx_deinit = lv_draw_arm2d_ctx_init;
+        driver->draw_ctx_size = sizeof(lv_draw_arm2d_ctx_t);
+    */
+}
+
+
+void lv_gpu_set_enable(bool en)
+{
+#if LV_USE_GPU
+    draw_ctx_setup_gpu(lv_disp_get_default()->driver->draw_ctx, en);
+#endif
+}
+
+bool lv_gpu_is_enabled(void)
+{
+#if LV_USE_GPU
+    epic_draw_ctx_t *my_draw_ctx = (epic_draw_ctx_t *)(lv_disp_get_default()->driver->draw_ctx);
+    lv_draw_sw_ctx_t *draw_ctx = &my_draw_ctx->sw_ctx;
+
+
+    return ((draw_blend == draw_ctx->blend) && (my_decode_and_draw == draw_ctx->base_draw.draw_img)
+            && (my_gpu_wait == draw_ctx->base_draw.wait_for_finish));
+#else
+    return false;
+#endif
+}
+
+
+
+#ifdef USING_EZIPA_DEC
+#include "ezipa_dec.h"
+
+
+int32_t gpu_ezipa_draw(ezipa_obj_t *obj, const lv_area_t *src_area, const lv_area_t *dst_area, bool next)
+{
+    int32_t r;
+
+    lv_disp_t *disp    = _lv_refr_get_disp_refreshing();
+    lv_draw_ctx_t *draw_ctx = disp->driver->draw_ctx;
+    const lv_area_t *disp_area = draw_ctx->buf_area;
+
+    my_gpu_wait(draw_ctx);
+
+    ezipa_canvas_t canvas;
+
+    canvas.width  = lv_area_get_width(disp_area);
+    canvas.height = lv_area_get_height(disp_area);
+    canvas.buf    = draw_ctx->buf;
+
+#if(16 == LV_COLOR_DEPTH)
+    canvas.color_fmt =       EPIC_OUTPUT_RGB565;
+#elif (24 == LV_COLOR_DEPTH)
+    canvas.color_fmt =       EPIC_OUTPUT_RGB888;
+#else
+#error "Unsupport format!"
+#endif
+
+    canvas.x_offset = src_area->x1 - disp_area->x1;
+    canvas.y_offset = src_area->y1 - disp_area->y1;
+
+    canvas.mask_x_offset = dst_area->x1 - disp_area->x1;
+    canvas.mask_y_offset = dst_area->y1 - disp_area->y1;
+    canvas.mask_width  = lv_area_get_width(dst_area);
+    canvas.mask_height = lv_area_get_height(dst_area);
+
+    //gpu_lock(DRV_EPIC_COLOR_BLEND, &src2, &src1, &output, NULL);
+
+    GPU_DEVICE_START();
+
+    r = ezipa_draw(obj, &canvas, next);
+    RT_ASSERT(0 == r);
+
+    GPU_DEVICE_STOP();
+
+    //gpu_unlock();
+
+    my_gpu_wait(draw_ctx);
+
+    return r;
+}
+
+#endif /* USING_EAZIP_DEC */
+
+
+
+#ifdef FINSH_USING_MSH
+#include <finsh.h>
+extern bool lv_refr_enable_full_buffer(bool enable);
+extern bool lv_refr_is_full_buffer_enabled(void);
+static rt_err_t gpu_cfg(int argc, char **argv)
+{
+
+    if (argc < 2)
+    {
+        rt_kprintf("gpu_cfg [OPTION] [VALUE]\n");
+        rt_kprintf("    OPTION:enable\n");
+        return RT_EOK;
+    }
+
+    if (strcmp(argv[1], "enable") == 0)
+    {
+        if (argc > 2) //write
+        {
+            uint32_t v = strtoul(argv[2], 0, 10);
+            lv_gpu_set_enable(v);
+        }
+
+        if (lv_gpu_is_enabled())
+            rt_kprintf("gpu is enable.\n");
+        else
+            rt_kprintf("gpu is disable.\n");
+    }
+    else if (strcmp(argv[1], "full_buf") == 0)
+    {
+        if (argc > 2) //write
+        {
+            uint32_t v = strtoul(argv[2], 0, 10);
+            lv_refr_enable_full_buffer(v);
+        }
+
+        if (lv_refr_is_full_buffer_enabled())
+            rt_kprintf("full buffer is enable.\n");
+        else
+            rt_kprintf("full buffer is disable.\n");
+    }
+    else
+    {
+        rt_kprintf("unknown option:%s\n", argv[1]);
+    }
+    return RT_EOK;
+}
+FINSH_FUNCTION_EXPORT(gpu_cfg, gpu configuration: gpu switch | compress rate etc.);
+MSH_CMD_EXPORT(gpu_cfg, gpu configurattion);
+#endif

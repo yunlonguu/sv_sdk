@@ -1,0 +1,73 @@
+/*
+ * SPDX-FileCopyrightText: 2006-2021 Lianway Corporation
+ * SPDX-FileCopyrightText: 2019-2025 SiFli Technologies(Nanjing) Co., Ltd
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef _BTS2_APP_PAN_H_
+#define _BTS2_APP_PAN_H_
+
+#include "bts2_app_demo.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#ifdef BT_FINSH_PAN
+
+void bt_pan_init(bts2_app_stru *bts2_app_data);
+void bt_pan_reg(bts2_app_stru *bts2_app_data);
+void bt_pan_enable(bts2_app_stru *bts2_app_data);
+int bt_pan_connect_request(BTS2S_BD_ADDR *remote_addr);
+void bt_pan_update_addr(BTS2S_BD_ADDR *bd_addr);
+void bt_pan_disc(BTS2S_BD_ADDR *bd);
+void bt_hdl_pan_msg(bts2_app_stru *bts2_app_data);
+
+void bt_pan_set_ip_addr(char *string);
+void bt_pan_set_netmask(char *string);
+void bt_pan_set_gw(char *string);
+void bt_pan_set_dns(char *string1, char *string2);
+void bt_pan_scan_proc_net_dev(void);
+void bt_pan_set_nap_route(char *string);
+void bt_pan_set_dns1(char *string);
+void bt_pan_set_dns2(char *string);
+void bt_pan_send_data(uint16_t bnep_id, void *buff, int len);
+
+#ifdef BT_PAN_NO_B0_NETIF
+/**
+ * @brief Weak hook called in the BT stack task for every ethernet frame
+ *        received over PAN/BNEP, before the frame enters the lwIP path.
+ *        Available only when the BT_PAN_NO_B0_NETIF option is enabled.
+ *
+ * The frame must be consumed synchronously during the call: @p buff is only
+ * valid until the hook returns (the receive buffer is freed by the caller
+ * right after) and the hook must not block, or PAN message handling stalls.
+ * The default weak implementation returns -1, so the frame continues to
+ * bnep_dev_recv_data().
+ *
+ * @param buff ethernet frame data, starting at the ethernet header; valid
+ *             only during the call
+ * @param len frame length in bytes
+ * @return 0: the frame has been consumed (the normal path is skipped);
+ *         non-zero: continue with the normal BNEP/lwIP path
+ */
+int bt_pan_on_raw_rx(void *buff, int len);
+#endif
+//extern BTS2S_ETHER_ADDR bt_pan_get_remote_mac_address(struct rt_bt_lwip_pan_dev *bt_dev);
+extern BTS2S_ETHER_ADDR bt_pan_get_mac_address();
+extern void lwip_sys_init(void);
+extern void lwip_system_uninit(void);
+extern BTS2S_ETHER_ADDR bconvbd2etherbig(BTS2S_BD_ADDR *bd);
+extern void pan_reg_req(U16 conn_hdl, U16 data_hdl, BTS2S_BD_ADDR local_bd);
+
+int bt_pan_connect_request_ext(BTS2S_BD_ADDR *remote_addr, U16 role);
+
+
+
+#endif
+
+#ifdef __cplusplus
+}
+#endif
+#endif

@@ -838,7 +838,87 @@ done:
 }
 #endif
 
-static rt_err_t render_arc(drv_epic_operation *p_operation, EPIC_LayerConfigTypeDef *dst, const EPIC_AreaTypeDef *p_clip_area)
+/* Bound the swept sector before generating A8 rows. Include the center for a
+ * conservative annular bound, plus fixed-point/AA edge coverage. */
+static bool clip_arc_sector(int32_t cx, int32_t cy, int32_t radius, int32_t width,
+                            uint16_t start, uint16_t end, bool rounded,
+                            EPIC_AreaTypeDef *clip)
+{
+    /* Large arcs are split by the backend; keep their existing clipping path. */
+    if (start == end || radius > EPIC_COORDINATES_MAX / 2) return true;
+    EPIC_AreaTypeDef bounds = {cx, cy, cx, cy};
+    uint16_t sweep = (end + 360 - start) % 360;
+    for (uint32_t i = 0; i < 6; i++)
+    {
+        uint16_t angle = i == 0 ? start : i == 1 ? end : (i - 2) * 90;
+        if (i >= 2 && (angle + 360 - start) % 360 > sweep) continue;
+        int32_t x = cx + ((radius * EPIC_TrigoCos(angle)) >> EPIC_TRIGO_SHIFT);
+        int32_t y = cy + ((radius * EPIC_TrigoSin(angle)) >> EPIC_TRIGO_SHIFT);
+        bounds.x0 = HAL_MIN(bounds.x0, x);
+        bounds.y0 = HAL_MIN(bounds.y0, y);
+        bounds.x1 = HAL_MAX(bounds.x1, x);
+        bounds.y1 = HAL_MAX(bounds.y1, y);
+    }
+    if (rounded)
+    {
+        for (uint32_t i = 0; i < 2; i++)
+        {
+            EPIC_AreaTypeDef cap;
+            get_rounded_area(i == 0 ? start : end, radius, width, &cap);
+            HAL_EPIC_AreaMove(&cap, cx, cy);
+            bounds.x0 = HAL_MIN(bounds.x0, cap.x0);
+            bounds.y0 = HAL_MIN(bounds.y0, cap.y0);
+            bounds.x1 = HAL_MAX(bounds.x1, cap.x1);
+            bounds.y1 = HAL_MAX(bounds.y1, cap.y1);
+        }
+    }
+    /* Clamp before assigning back to the coordinate type. */
+    clip->x0 = HAL_MAX(clip->x0, (int32_t)bounds.x0 - 2);
+    clip->y0 = HAL_MAX(clip->y0, (int32_t)bounds.y0 - 2);
+    clip->x1 = HAL_MIN(clip->x1, (int32_t)bounds.x1 + 2);
+    clip->y1 = HAL_MIN(clip->y1, (int32_t)bounds.y1 + 2);
+    return clip->x0 <= clip->x1 && clip->y0 <= clip->y1;
+}
+
+/* Only ARC writes mask_buf2_pool. Reuse an identical round-cap bitmap within
+ * this render pass; the pass-local key avoids retaining stale non-retention RAM. */
+static void prepare_arc_cap(int32_t width, int32_t *cached_width)
+{
+    if (*cached_width == width) return;
+    drv_epic_mask_opa_t *circle_mask = (drv_epic_mask_opa_t *)gp_drv_epic->mask_buf2_pool;
+    /*
+        Avoid 'mask_buf2_pool' is still using by previous blending,
+        befre we overwrite it.
+    */
+    HAL_StatusTypeDef ret =  Call_Hal_Api(HAL_API_ALL_STOP, NULL, NULL, NULL);
+    DRV_EPIC_ASSERT(HAL_OK == ret);
+
+    memset(circle_mask, 0xff, width * width);
+
+    drv_epic_mask_area_t circle_area = {0, 0, width - 1, width - 1};
+    drv_epic_mask_radius_param_t circle_mask_param;
+    drv_epic_mask_radius_init(&circle_mask_param, &circle_area, width / 2, false);
+    void *circle_mask_list[2] = {&circle_mask_param, NULL};
+
+
+    drv_epic_mask_opa_t *circle_mask_tmp = circle_mask;
+    for (int32_t h = 0; h < width; h++)
+    {
+        drv_epic_mask_res_t res = drv_epic_mask_apply(circle_mask_list, circle_mask_tmp, 0, h, width);
+        if (res == DRAW_MASK_RES_TRANSP)
+        {
+            memset(circle_mask_tmp, 0x00, width);
+        }
+
+        circle_mask_tmp += width;
+    }
+
+    drv_epic_mask_free_param(&circle_mask_param);
+    *cached_width = width;
+}
+
+static rt_err_t render_arc(drv_epic_operation *p_operation, EPIC_LayerConfigTypeDef *dst,
+                           const EPIC_AreaTypeDef *p_clip_area, int32_t *cached_cap_width)
 {
     int16_t center_x = p_operation->desc.arc.center_x;
     int16_t center_y = p_operation->desc.arc.center_y;
@@ -881,6 +961,10 @@ static rt_err_t render_arc(drv_epic_operation *p_operation, EPIC_LayerConfigType
     while (start_angle >= 360) start_angle -= 360;
     while (end_angle >= 360) end_angle -= 360;
 
+    if (!clip_arc_sector(center_x, center_y, radius, width, start_angle, end_angle,
+                         p_operation->desc.arc.round_start || p_operation->desc.arc.round_end,
+                         &clipped_area)) return RT_EOK;
+
 
 
 
@@ -897,34 +981,7 @@ static rt_err_t render_arc(drv_epic_operation *p_operation, EPIC_LayerConfigType
         RT_ASSERT(width * width <= mask_buf2_max_bytes);
         circle_mask = (drv_epic_mask_opa_t *)gp_drv_epic->mask_buf2_pool;
 
-        /*
-            Avoid 'mask_buf2_pool' is still using by previous blending,
-            befre we overwrite it.
-        */
-        HAL_StatusTypeDef ret =  Call_Hal_Api(HAL_API_ALL_STOP, NULL, NULL, NULL);
-        DRV_EPIC_ASSERT(HAL_OK == ret);
-
-        memset(circle_mask, 0xff, width * width);
-
-        drv_epic_mask_area_t circle_area = {0, 0, width - 1, width - 1};
-        drv_epic_mask_radius_param_t circle_mask_param;
-        drv_epic_mask_radius_init(&circle_mask_param, &circle_area, width / 2, false);
-        void *circle_mask_list[2] = {&circle_mask_param, NULL};
-
-
-        drv_epic_mask_opa_t *circle_mask_tmp = circle_mask;
-        for (int32_t h = 0; h < width; h++)
-        {
-            drv_epic_mask_res_t res = drv_epic_mask_apply(circle_mask_list, circle_mask_tmp, 0, h, width);
-            if (res == DRAW_MASK_RES_TRANSP)
-            {
-                memset(circle_mask_tmp, 0x00, width);
-            }
-
-            circle_mask_tmp += width;
-        }
-
-        drv_epic_mask_free_param(&circle_mask_param);
+        prepare_arc_cap(width, cached_cap_width);
 
         get_rounded_area(start_angle, radius, width, &round_area_1);
         HAL_EPIC_AreaMove(&round_area_1, center_x, center_y);
@@ -2583,6 +2640,7 @@ static rt_err_t render(drv_epic_render_list_t list)
     priv_render_list_t *rl = (priv_render_list_t *) list;
     EPIC_LayerConfigTypeDef *dst = &rl->dst;
     rt_err_t ret_v = RT_EEMPTY;
+    int32_t cached_cap_width = 0;
     if (gp_drv_epic->dbg_flag_print_exe_detail)
     {
         LOG_E("\n");
@@ -2636,7 +2694,7 @@ static rt_err_t render(drv_epic_render_list_t list)
 
                 case DRV_EPIC_DRAW_ARC:
                 {
-                    rt_err_t result = render_arc(p_operation, dst, &intersect_area);
+                    rt_err_t result = render_arc(p_operation, dst, &intersect_area, &cached_cap_width);
                     if (result != RT_EOK)
                     {
                         LOG_E("arc render failed: %d", result);

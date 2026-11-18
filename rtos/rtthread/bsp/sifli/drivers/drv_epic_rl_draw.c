@@ -393,6 +393,14 @@ static void merge_image_mask(EPIC_LayerConfigTypeDef *mask, const EPIC_LayerConf
     }
 }
 
+#ifdef DRV_EPIC_MASK_BUF_IN_PSRAM
+/* Only the render task uses this scratch line; DMA reads the ping-pong pool.
+ * Avoid repeated angle/radius mask reads and writes directly in PSRAM. */
+L1_NON_RET_BSS_SECT_BEGIN(drv_epic_mask_line)
+L1_NON_RET_BSS_SECT(drv_epic_mask_line, ALIGN(RT_ALIGN_SIZE) static uint8_t drv_epic_mask_line[EPIC_COORDINATES_MAX]);
+L1_NON_RET_BSS_SECT_END
+#endif
+
 /* CPU produces A8 coverage; EPIC reads it through DMA. */
 static inline void clean_software_mask(const EPIC_LayerConfigTypeDef *mask)
 {
@@ -422,13 +430,18 @@ static rt_err_t draw_masked_rect(EPIC_LayerConfigTypeDef *dst, EPIC_LayerConfigT
     if (image && !p_rect_desc->fill_bg && !_layer_IntersectArea(image, &com_area, &com_area)) return RT_EOK;
     if ((image || p_rect_desc->is_grad) && p_extra_mask_layer && p_extra_mask_layer->data &&
             !_layer_IntersectArea(p_extra_mask_layer, &com_area, &com_area)) return RT_EOK;
-    if (image && HAL_EPIC_AreaWidth(&com_area) > ARC_IMG_TILE_WIDTH)
+    /* Honor the configured tile dimensions without exceeding either half
+     * of the A8 ping-pong pool or the EPIC coordinate limit. */
+    int32_t image_tile_width = MIN(ARC_IMG_TILE_WIDTH,
+                                  MIN(gp_drv_epic->dbg_mask_buf_pool_max / 2, EPIC_COORDINATES_MAX));
+    if (image && image_tile_width <= 0) return -RT_ENOMEM;
+    if (image && HAL_EPIC_AreaWidth(&com_area) > image_tile_width)
     {
-        for (int32_t left = com_area.x0; left <= com_area.x1; left += ARC_IMG_TILE_WIDTH)
+        for (int32_t left = com_area.x0; left <= com_area.x1; left += image_tile_width)
         {
             EPIC_AreaTypeDef tile = com_area;
             tile.x0 = left;
-            tile.x1 = MIN(left + ARC_IMG_TILE_WIDTH - 1, com_area.x1);
+            tile.x1 = MIN(left + image_tile_width - 1, com_area.x1);
             rt_err_t result = draw_masked_rect(dst, p_extra_mask_layer, masks, &tile, p_rect_desc,
                                p_circle_mask_area1, p_circle_mask_area2, p_circle_mask_buf,
                                circle_mask_width);
@@ -450,6 +463,10 @@ static rt_err_t draw_masked_rect(EPIC_LayerConfigTypeDef *dst, EPIC_LayerConfigT
     RT_ASSERT(mask_buf_h > 0);
     drv_epic_mask_opa_t *mask_buf = (drv_epic_mask_opa_t *)gp_drv_epic->mask_buf_pool;
     drv_epic_mask_opa_t *mask_buf_ping_pong = mask_buf;
+    drv_epic_mask_opa_t *scratch_line = NULL;
+#ifdef DRV_EPIC_MASK_BUF_IN_PSRAM
+    if (image) scratch_line = drv_epic_mask_line;
+#endif
 
     EPIC_AreaTypeDef mask_area = com_area;
     EPIC_AreaTypeDef fill_area = com_area;
@@ -507,8 +524,8 @@ static rt_err_t draw_masked_rect(EPIC_LayerConfigTypeDef *dst, EPIC_LayerConfigT
     for (int32_t f = 0; f < blend_h;)
     {
         int32_t fill_h = MIN(mask_buf_h, blend_h - f);
-        if (image && Call_Hal_Api(HAL_API_ALL_STOP, NULL, NULL, NULL) != HAL_OK)
-            return -RT_ERROR;
+        /* Generate coverage in the inactive half while EPIC reads the other.
+         * Fence before submitting, rather than before generating this mask. */
         drv_epic_mask_opa_t *mask_buf_sub;
         drv_epic_mask_res_t mask_res = DRAW_MASK_RES_TRANSP;
 
@@ -517,9 +534,14 @@ static rt_err_t draw_masked_rect(EPIC_LayerConfigTypeDef *dst, EPIC_LayerConfigT
         mask_area.y1 = fill_area.y0;
 
         mask_buf_sub = mask_buf_ping_pong;
-        memset(mask_buf_sub, 0xff, blend_w * fill_h);
+        if (!scratch_line) memset(mask_buf_sub, 0xff, blend_w * fill_h);
         for (int32_t h = 0; h < fill_h; h++)
         {
+            if (scratch_line)
+            {
+                mask_buf_sub = scratch_line;
+                memset(mask_buf_sub, 0xff, blend_w);
+            }
             drv_epic_mask_res_t mask_res_sub = drv_epic_mask_apply(masks, mask_buf_sub, mask_area.x0, mask_area.y0, blend_w);
 
 
@@ -557,9 +579,21 @@ static rt_err_t draw_masked_rect(EPIC_LayerConfigTypeDef *dst, EPIC_LayerConfigT
             else
                 memset(mask_buf_sub, 0x00, blend_w);
 
+            if (scratch_line)
+            {
+                if (mask_res_sub != DRAW_MASK_RES_TRANSP && p_extra_mask_layer)
+                {
+                    const uint8_t *parent = p_extra_mask_layer->data +
+                        (mask_area.y0 - p_extra_mask_layer->y_offset) * p_extra_mask_layer->total_width +
+                        mask_area.x0 - p_extra_mask_layer->x_offset;
+                    for (int32_t x = 0; x < blend_w; x++)
+                        scratch_line[x] = ((uint32_t)scratch_line[x] * parent[x] + 127) / 255;
+                }
+                memcpy(mask_buf_ping_pong + h * blend_w, scratch_line, blend_w);
+            }
             mask_area.y0 ++;
             mask_area.y1 ++;
-            mask_buf_sub += blend_w;
+            if (!scratch_line) mask_buf_sub += blend_w;
         }
 
         fill_area.y1 =  fill_area.y0 + fill_h - 1;
@@ -588,8 +622,12 @@ static rt_err_t draw_masked_rect(EPIC_LayerConfigTypeDef *dst, EPIC_LayerConfigT
 
             if (image)
             {
-                merge_image_mask(p_mask_layer, p_extra_mask_layer);
+                if (!scratch_line) merge_image_mask(p_mask_layer, p_extra_mask_layer);
                 clean_software_mask(p_mask_layer);
+                /* Finish the previous job before handing over this half. This
+                 * also covers a HAL blend that clips to an empty operation. */
+                if (Call_Hal_Api(HAL_API_ALL_STOP, NULL, NULL, NULL) != HAL_OK)
+                    return -RT_ERROR;
                 input_layers[0] = output_layer;
                 uint8_t input_layer_num = 3;
                 if (p_rect_desc->fill_bg)

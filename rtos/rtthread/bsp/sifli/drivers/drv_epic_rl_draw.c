@@ -393,6 +393,14 @@ static void merge_image_mask(EPIC_LayerConfigTypeDef *mask, const EPIC_LayerConf
     }
 }
 
+/* CPU produces A8 coverage; EPIC reads it through DMA. */
+static inline void clean_software_mask(const EPIC_LayerConfigTypeDef *mask)
+{
+#ifdef DRV_EPIC_MASK_BUF_IN_PSRAM
+    mpu_dcache_clean(mask->data, mask->data_size);
+#endif
+}
+
 static rt_err_t draw_masked_rect(EPIC_LayerConfigTypeDef *dst, EPIC_LayerConfigTypeDef *p_extra_mask_layer,
                                  void *masks[], const EPIC_AreaTypeDef *p_draw_area, draw_rect_dsc_t *p_rect_desc,
                                  const EPIC_AreaTypeDef *p_circle_mask_area1,
@@ -581,6 +589,7 @@ static rt_err_t draw_masked_rect(EPIC_LayerConfigTypeDef *dst, EPIC_LayerConfigT
             if (image)
             {
                 merge_image_mask(p_mask_layer, p_extra_mask_layer);
+                clean_software_mask(p_mask_layer);
                 input_layers[0] = output_layer;
                 uint8_t input_layer_num = 3;
                 if (p_rect_desc->fill_bg)
@@ -614,12 +623,14 @@ static rt_err_t draw_masked_rect(EPIC_LayerConfigTypeDef *dst, EPIC_LayerConfigT
                     merge_image_mask(p_mask_layer, p_extra_mask_layer);
                 }
 
+                clean_software_mask(p_mask_layer);
                 input_layers[0] = output_layer; //Setup bg layer
                 ret =  Call_Hal_Api(HAL_API_BLEND_EX, input_layers, (void *)((uint32_t)3), &output_layer);
                 DRV_EPIC_ASSERT(HAL_OK == ret);
             }
             else
             {
+                clean_software_mask(p_mask_layer);
                 ret =  Call_Hal_Api(HAL_API_CONT_BLEND, p_mask_layer, p_extra_mask_layer, &output_layer);
                 DRV_EPIC_ASSERT(HAL_OK == ret);
             }

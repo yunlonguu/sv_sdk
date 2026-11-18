@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "drv_epic.h"
+#include "mem_section.h"
 #if defined(DRV_EPIC_NEW_API) && defined(BSP_USING_EPIC)
 #include "drv_epic_private.h"
 #include "drv_epic_mask.h"

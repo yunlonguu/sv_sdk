@@ -334,7 +334,7 @@ menu "On-chip Peripherals"
 
             config DRV_EPIC_MASK_BUF_IN_PSRAM
                 bool "Place EPIC software A8 mask pool in PSRAM"
-                depends on DRV_EPIC_NEW_API && BSP_USING_PSRAM
+                depends on DRV_EPIC_NEW_API && (BSP_USING_PSRAM || DRV_EPIC_NEW_API_DUAL_CORE_ACPU)
                 default n
                 help
                     Reserve the software mask ping-pong pool in PSRAM instead

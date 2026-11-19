@@ -166,7 +166,7 @@ void BSP_PIN_Init(void)
 
     HAL_PIN_Set(PAD_PA80, GPIO_A80, PIN_PULLUP, 1);             // BT_WAKEUP_MCU
 
-    HAL_PIN_Set(PAD_PA44, GPIO_A44, PIN_NOPULL, 1);
+    // HAL_PIN_Set(PAD_PA44, GPIO_A44, PIN_NOPULL, 1);
     HAL_PIN_Set(PAD_PA50, GPIO_A50, PIN_NOPULL, 1);             // MIC_EN
 #endif
 
@@ -197,7 +197,7 @@ void BSP_PIN_Init(void)
     HAL_PIN_Set(PAD_PB24, GPIO_B24, PIN_PULLDOWN, 0);       // TWI_SDA
     HAL_PIN_Set(PAD_PB25, GPIO_B25, PIN_PULLDOWN, 0);       // TWI_SCL
     HAL_PIN_Set(PAD_PB26, GPIO_B26, PIN_PULLUP, 0);         // CHRG
-    HAL_PIN_Set(PAD_PB28, GPIO_B28, PIN_PULLUP, 0);         // STDBY
+    // HAL_PIN_Set(PAD_PB28, GPIO_B28, PIN_PULLUP, 0);         // STDBY
 
     HAL_PIN_Set(PAD_PB27, GPIO_B27, PIN_PULLUP, 0);         // RTC_EINT
 

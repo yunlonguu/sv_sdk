@@ -62,6 +62,12 @@ L2_NON_RET_BSS_SECT(drv_epic_letters, ALIGN(RT_ALIGN_SIZE) static drv_epic_lette
 L2_NON_RET_BSS_SECT_END
 #endif
 
+#ifdef DRV_EPIC_SHADOW_CACHE_IN_PSRAM
+/* HCPU owns the PSRAM allocation, including when ACPU renders the shadows. */
+L2_NON_RET_BSS_SECT_BEGIN(drv_epic_shadow_cache)
+L2_NON_RET_BSS_SECT(drv_epic_shadow_cache, ALIGN(RT_ALIGN_SIZE) static uint8_t drv_epic_shadow_cache_buf[shadow_cache_max_bytes]);
+L2_NON_RET_BSS_SECT_END
+#endif
 
 
 
@@ -595,7 +601,8 @@ static void epic_task(void *param)
                         last = 0;
                     }
 
-                    if (RT_EOK == render_list(&drv_epic, rl))
+                    err = render_list(&drv_epic, rl);
+                    if (RT_EOK == err)
                     {
                         if (p_RenderDrawctx->partial_done_cb)
                         {
@@ -616,7 +623,10 @@ static void epic_task(void *param)
                     }
                     else
                     {
-                        LOG_E("Render list failed, the render list has not intersect with the dst layer area typically.");
+                        LOG_E("Render list failed: err=%d, dst=[%d,%d,%d,%d]", err,
+                              p_dst->x_offset, p_dst->y_offset,
+                              p_dst->x_offset + p_dst->width - 1,
+                              p_dst->y_offset + p_dst->height - 1);
                         print_rl(rl);
 
                         if (p_RenderDrawctx->partial_done_cb)
@@ -1233,6 +1243,9 @@ rt_err_t drv_epic_render_list_init(void)
         drv_epic.render_list_pool = &drv_epic_render_list_pool[0];
         drv_epic.mask_buf_pool = &drv_epic_mask_buf_pool[0];
         drv_epic.mask_buf2_pool = &drv_epic_mask_buf2_pool[0];
+#ifdef DRV_EPIC_SHADOW_CACHE_IN_PSRAM
+        drv_epic.shadow_cache_buf = &drv_epic_shadow_cache_buf[0];
+#endif
 #if (rotate_buf_bytes > 0)
         drv_epic.rotate_buf = &drv_epic_rotate_buf[0];
 #endif

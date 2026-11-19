@@ -73,6 +73,7 @@ extern "C" {
 #endif
 #define mask_buf_max_bytes      (16*1024)
 #define mask_buf2_max_bytes     1600
+#define shadow_cache_max_bytes (16 * 1024)
 #if defined(ROTATE_BUF_SIZE) && defined(ROTATE_BUF_IN_SRAM)
 #define rotate_buf_bytes   ROTATE_BUF_SIZE
 #else
@@ -269,6 +270,8 @@ typedef struct
     uint32_t dbg_render_buf_max;
 
 
+    /* Keep this shared pointer unconditional so both cores use the same layout. */
+    uint8_t *shadow_cache_buf;
     uint32_t magic_num; /* Magic number to check whether the handle is valid,the vaule should be 0xBEEFBEEF*/
 
     /* Put OS related variables after magic_num to avoid different OS data structure between HCPU&ACPU*/

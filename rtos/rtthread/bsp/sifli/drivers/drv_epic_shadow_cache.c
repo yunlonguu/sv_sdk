@@ -21,7 +21,7 @@
 #endif
 
 #define SHADOW_CACHE_ENTRY_COUNT 8       /* Maximum number of cached shapes. */
-#define SHADOW_CACHE_MAX_BYTES   (16 * 1024) /* Fixed SRAM pool size. */
+#define SHADOW_CACHE_MAX_BYTES   shadow_cache_max_bytes
 
 /* A cache entry stores an offset because the static pool may be compacted. */
 typedef struct
@@ -54,10 +54,15 @@ typedef struct
 static shadow_cache_stats_t cache_stats;
 #endif
 
-/* Keep generated masks in a fixed SRAM pool, independent of render-list lifetime. */
+#ifdef DRV_EPIC_SHADOW_CACHE_IN_PSRAM
+/* Use HCPU-owned PSRAM; ACPU does not need a separate PSRAM linker region. */
+#define cache_data (gp_drv_epic->shadow_cache_buf)
+#else
+/* Keep generated masks in a fixed pool, independent of render-list lifetime. */
 L1_NON_RET_BSS_SECT_BEGIN(drv_epic_shadow_cache)
 L1_NON_RET_BSS_SECT(drv_epic_shadow_cache, ALIGN(RT_ALIGN_SIZE) static uint8_t cache_data[SHADOW_CACHE_MAX_BYTES]);
 L1_NON_RET_BSS_SECT_END
+#endif
 
 static bool key_equal(const drv_epic_shadow_cache_key_t *a, const drv_epic_shadow_cache_key_t *b)
 {
@@ -118,6 +123,9 @@ rt_err_t drv_epic_shadow_cache_acquire(const drv_epic_shadow_cache_key_t *key,
                                        uint8_t **mask)
 {
     RT_ASSERT(key != NULL && generate != NULL && mask != NULL && bytes > 0);
+#ifdef DRV_EPIC_SHADOW_CACHE_IN_PSRAM
+    RT_ASSERT(gp_drv_epic != NULL && cache_data != NULL);
+#endif
 
     rt_err_t err = rt_mutex_take(&cache_mutex, RT_WAITING_FOREVER);
     RT_ASSERT(err == RT_EOK);

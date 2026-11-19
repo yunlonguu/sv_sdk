@@ -289,6 +289,17 @@ menu "On-chip Peripherals"
                 Allocate temporary EPIC render-list operations from app_mem's reusable
                 animation heap first, then fall back to the normal app cache path.
                 This is narrower than defining SOLUTION globally.
+
+            config DRV_EPIC_SHADOW_CACHE_IN_PSRAM
+                bool "Place EPIC shadow mask cache in PSRAM"
+                depends on DRV_EPIC_NEW_API
+                depends on BSP_USING_PSRAM || DRV_EPIC_NEW_API_DUAL_CORE_ACPU
+                default n
+                help
+                    Move the fixed 16 KB shadow mask cache from SRAM to PSRAM.
+                    In dual-core mode, enable this option in both HCPU and ACPU
+                    projects. HCPU reserves the PSRAM buffer and shares its
+                    address with ACPU. Rebuild and flash both cores together.
             
             choice
                 prompt "EPIC Render List API Mode"

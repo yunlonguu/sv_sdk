@@ -3686,6 +3686,10 @@ def DoBuilding(target, objects):
                 local_group(group, objects)
         program = Env.Program(target, objects)
 
+    if program and "PTAB_HEADER" in Env:
+        # Compile objects only after the generated memory-map header exists.
+        Env.Depends(program[0].sources, Env["PTAB_HEADER"])
+
     import rtconfig
     try:
         logging.debug(rtconfig.PRE_ACTION)

@@ -48,7 +48,9 @@ L1_NON_RET_BSS_SECT_BEGIN(drv_epic_stack)
 #ifndef DRV_EPIC_MASK_BUF_IN_PSRAM
 L1_NON_RET_BSS_SECT(drv_epic_stack, ALIGN(RT_ALIGN_SIZE) static uint8_t drv_epic_mask_buf_pool[mask_buf_max_bytes]);
 #endif
+#ifndef DRV_EPIC_MASK_BUF2_IN_PSRAM
 L1_NON_RET_BSS_SECT(drv_epic_stack, ALIGN(RT_ALIGN_SIZE) static uint8_t drv_epic_mask_buf2_pool[mask_buf2_max_bytes]);
+#endif
 #ifndef DRV_EPIC_LETTER_POOL_IN_PSRAM
 L1_NON_RET_BSS_SECT(drv_epic_stack, ALIGN(RT_ALIGN_SIZE) static drv_epic_letter_type_t drv_epic_letter_pool[letter_pool_max * render_list_pool_max]);
 #endif
@@ -61,6 +63,12 @@ L1_NON_RET_BSS_SECT_END
 #ifdef DRV_EPIC_MASK_BUF_IN_PSRAM
 L2_NON_RET_BSS_SECT_BEGIN(drv_epic_masks)
 L2_NON_RET_BSS_SECT(drv_epic_masks, ALIGN(64) static uint8_t drv_epic_mask_buf_pool[RT_ALIGN(mask_buf_max_bytes, 64)]);
+L2_NON_RET_BSS_SECT_END
+#endif
+
+#ifdef DRV_EPIC_MASK_BUF2_IN_PSRAM
+L2_NON_RET_BSS_SECT_BEGIN(drv_epic_arc_caps)
+L2_NON_RET_BSS_SECT(drv_epic_arc_caps, ALIGN(64) static uint8_t drv_epic_mask_buf2_pool[mask_buf2_max_bytes]);
 L2_NON_RET_BSS_SECT_END
 #endif
 

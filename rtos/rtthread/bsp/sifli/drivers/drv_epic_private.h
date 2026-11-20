@@ -76,7 +76,8 @@ extern "C" {
 #else
 #define mask_buf_max_bytes      (16*1024)
 #endif
-#define mask_buf2_max_bytes     1600
+/* A width-by-width A8 round cap; supports arc widths up to 64 pixels. */
+#define mask_buf2_max_bytes     (64 * 64)
 #if defined(ROTATE_BUF_SIZE) && defined(ROTATE_BUF_IN_SRAM)
 #define rotate_buf_bytes   ROTATE_BUF_SIZE
 #else

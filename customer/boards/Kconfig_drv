@@ -341,6 +341,15 @@ menu "On-chip Peripherals"
                     of SRAM. The pool size is set by DRV_EPIC_MASK_BUF_SIZE.
                     CPU-written masks are cleaned before EPIC reads them.
 
+            config DRV_EPIC_MASK_BUF2_IN_PSRAM
+                bool "Place EPIC arc round-cap mask pool in PSRAM"
+                depends on DRV_EPIC_NEW_API && (BSP_USING_PSRAM || DRV_EPIC_NEW_API_DUAL_CORE_ACPU)
+                default n
+                help
+                    Place the 4096-byte A8 round-cap workspace in PSRAM
+                    instead of SRAM. Supports arc widths up to 64 pixels.
+                    This is independent of the main mask ping-pong pool.
+
             config ARC_IMG_TILE_WIDTH
                 int "Arc image horizontal tile width in pixels"
                 default 64

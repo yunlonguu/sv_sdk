@@ -25,6 +25,7 @@
 #include "../../../external/lvgl_v9/src/misc/lv_area_private.h"
 #ifdef DRV_EPIC_NEW_API
 #include "lv_display_private.h"
+#include "lv_refr_private.h"
 #endif
 #ifdef USING_EZIPA_DEC
 #include "ezipa_dec.h"

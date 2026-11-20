@@ -22,6 +22,7 @@
 
 #include "lv_display_private.h"
 #include "lv_refr_private.h"
+#include "lv_area_private.h"
 #include "lv_draw_epic.h"
 
 #if defined(BSP_USING_LCD_FRAMEBUFFER)

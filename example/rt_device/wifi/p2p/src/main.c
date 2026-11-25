@@ -17,6 +17,21 @@
 #define ECHO_SERVER_PORT    8888                /* TCP echo server port */
 #define ECHO_BUF_SIZE       256                 /* Echo buffer size */
 
+/*
+ * AIC8800D40/D40-N register two wlan devices: wlan0 is STA-only and wlan1 is
+ * AP-only, and the P2P GO shares the AP data path, so the GO must be started
+ * on the AP device. Single-device drivers (AIC8800MC/SWT6621) only expose
+ * wlan0 and switch roles on it.
+ */
+static const char *wifi_ap_dev_name(void)
+{
+    if (rt_device_find(RT_WLAN_DEVICE_AP_NAME) != RT_NULL)
+    {
+        return RT_WLAN_DEVICE_AP_NAME;
+    }
+    return RT_WLAN_DEVICE_STA_NAME;
+}
+
 
 /**
  * @brief  TCP echo server thread - echoes back all received data
@@ -159,7 +174,19 @@ MSH_CMD_EXPORT(p2p_stop, stop P2P GO mode and TCP echo server);
 int main(void)
 {
     rt_thread_t tid;
-    rt_wlan_set_mode("wlan0", RT_WLAN_AP);
+    rt_err_t ret;
+
+    /*
+     * Put the AP device into AP mode: the lwIP bridge only starts the DHCP
+     * server for a device in RT_WLAN_AP mode, and the P2P GO shares the AP
+     * data path. On dual-device drivers this must be wlan1, not wlan0.
+     */
+    ret = rt_wlan_set_mode(wifi_ap_dev_name(), RT_WLAN_AP);
+    if (ret != RT_EOK)
+    {
+        rt_kprintf("[P2P] set_mode(%s, AP) failed: %d\n", wifi_ap_dev_name(), ret);
+        return -1;
+    }
 
     tid = rt_thread_create("p2p_go",
                            wifi_p2p_auto_go_thread,

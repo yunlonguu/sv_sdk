@@ -24,6 +24,8 @@
 #endif
 struct rt_wlan_device *s_wlan_dev = NULL;
 struct rt_wlan_device *s_ap_dev = NULL;
+static rt_bool_t s_wifi_initialized = RT_FALSE;
+
 rt_err_t aic8800_init(struct rt_wlan_device *wlan)
 {
     int ret = 0;
@@ -36,7 +38,21 @@ rt_err_t aic8800_init(struct rt_wlan_device *wlan)
     platform_pwr_wifi_pin_enable();
 #endif
 
+    /* The framework calls wlan_init once per device and this driver registers
+     * two (wlan0 STA_ONLY + wlan1 AP_ONLY). Keep the underlying SDIO/firmware
+     * init idempotent, otherwise the SDIO driver is registered twice and
+     * aic_wifi_init() runs twice on the same card. rt_wlan_set_mode() holds
+     * MGNT_LOCK while calling this, so no extra locking is needed here. */
+    if (s_wifi_initialized)
+    {
+        return 0;
+    }
+
     ret = wifi_if_sdio_init();
+    if (ret == 0)
+    {
+        s_wifi_initialized = RT_TRUE;
+    }
     return ret;
 }
 
@@ -358,7 +374,16 @@ rt_err_t aic8800_p2p_go_start(struct rt_wlan_device *wlan, struct rt_ap_info *ap
 
     if (ret >= 0)
     {
+        /* AP_START: the lwIP bridge starts the DHCP server and assigns the GO
+         * address (CONFIG_DHCPD_SERVER_IP) on this event.
+         * CONNECT:   rt_wlan_p2p_go_start() waits for CONNECT/CONNECT_FAIL
+         * before it returns. */
         rt_wlan_dev_indicate_event_handle(wlan, RT_WLAN_DEV_EVT_AP_START, NULL);
+        rt_wlan_dev_indicate_event_handle(wlan, RT_WLAN_DEV_EVT_CONNECT, NULL);
+    }
+    else
+    {
+        rt_wlan_dev_indicate_event_handle(wlan, RT_WLAN_DEV_EVT_CONNECT_FAIL, NULL);
     }
 
     return ret;
@@ -371,7 +396,10 @@ rt_err_t aic8800_p2p_go_stop(struct rt_wlan_device *wlan)
     ret = wlan_stop_p2p(0);
     if (ret == 0)
     {
+        /* AP_STOP: the lwIP bridge stops the DHCP server and brings the netif down.
+         * DISCONNECT: rt_wlan_p2p_go_stop() waits for this event before it returns. */
         rt_wlan_dev_indicate_event_handle(wlan, RT_WLAN_DEV_EVT_AP_STOP, NULL);
+        rt_wlan_dev_indicate_event_handle(wlan, RT_WLAN_DEV_EVT_DISCONNECT, NULL);
     }
     else
     {
